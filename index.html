@@ -155,12 +155,16 @@ const STORES = ['F1', 'F2'], NESTS = ['N1', 'N2'];
 const LR = mulberry(2024);
 for (const k in CH) {
   const c = CH[k];
-  c.wob = [2, 3, 4, 5, 7].map(j => ({ j, a: (0.6 + LR() * 0.8) / j, ph: LR() * 6.283 }));
+  c.wob = [2, 3, 4, 5, 6, 8, 11].map(j => ({ j, a: (0.6 + LR() * 0.8) / Math.pow(j, 0.8), ph: LR() * 6.283 }));
+  // a few rounded alcoves bulging out of the walls and ceiling (angles PI..2PI are the ceiling)
+  c.bulge = Array.from({ length: 4 }, (_, i) => ({ th: Math.PI * (0.92 + i * 0.36 + (LR() - 0.5) * 0.25), a: 0.12 + LR() * 0.12, w: 0.18 + LR() * 0.14 }));
 }
-function lump(ch, th, floorAmp = 0.025, wallAmp = 0.11) { // radius scale at angle th (y down: floor is 0..PI)
+function lump(ch, th, floorAmp = 0.03, wallAmp = 0.2) { // radius scale at angle th (y down: floor is 0..PI)
   let n = 0; for (const w of ch.wob) n += w.a * Math.sin(w.j * th + w.ph);
-  const floorness = Math.max(0, Math.sin(th)), amp = lerp(wallAmp, floorAmp, Math.pow(floorness, 0.6));
-  return 1 + n * amp;
+  const floorness = Math.max(0, Math.sin(th)), wallness = 1 - Math.pow(floorness, 0.6), amp = lerp(wallAmp, floorAmp, 1 - wallness);
+  let bump = 0;
+  for (const b of ch.bulge) { const d = Math.atan2(Math.sin(th - b.th), Math.cos(th - b.th)); bump += b.a * Math.exp(-(d * d) / (2 * b.w * b.w)); }
+  return 1 + n * amp + bump * wallness;
 }
 function floorPt(ch, u, lift = 0) {
   const th = Math.acos(clamp(u, -1, 1)), sc = lump(ch, th);
