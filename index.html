@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#6ec3f4">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Ant Colony</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#4a2e1a}
@@ -18,9 +20,14 @@
 // Ant Colony: a no-controls, no-lose ant farm for small kids.
 // World is 1600x1000 units; the surface is at y=SURF. Everything is vector-drawn.
 // ---------------------------------------------------------------------------
-const W = 1600, H = 1000, SURF = 250;
+const W = 1600, H = 1000, SURF = 250, VIEW_TOP = 105, VIEW_W = 1300, VIEW_CX = 925;
 const params = new URLSearchParams(location.search);
 const SPEED = Math.max(0.1, Math.min(60, +params.get('speed') || 1));
+const COARSE = matchMedia('(pointer: coarse)').matches;
+const PHONE = params.has('phone') || (COARSE && Math.min(screen.width, screen.height) < 700);
+const AS = PHONE ? 2.35 : 1.75;      // ant drawing scale
+const K = AS / 1.75;                 // creature/food scale relative to desktop
+const LIFT = 6 * AS;                 // ant body centre above the floor
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -32,27 +39,23 @@ function mulberry(s) { return () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Ma
 
 // ---- Colony layout -------------------------------------------------------
 // Chambers are ellipses; ants walk along the floor (the lower half of the ellipse).
+// `door` is the floor position (-1..1) where the tunnel comes in.
 const CH = {
-  F: { cx: 470, cy: 445, rx: 165, ry: 62, door: 0.92 },   // food store
-  N: { cx: 1160, cy: 600, rx: 190, ry: 70, door: -0.92 }, // nursery
-  Q: { cx: 480, cy: 812, rx: 185, ry: 80, door: 0.92 },   // queen's room
+  F1: { cx: 470, cy: 432, rx: 155, ry: 58, door: 0.92, kind: 'store' },
+  F2: { cx: 1180, cy: 420, rx: 150, ry: 56, door: -0.92, kind: 'store' },
+  N1: { cx: 1165, cy: 648, rx: 178, ry: 64, door: -0.92, kind: 'nest' },
+  N2: { cx: 470, cy: 660, rx: 168, ry: 62, door: 0.92, kind: 'nest' },
+  Q: { cx: 935, cy: 878, rx: 205, ry: 74, door: -0.92, kind: 'queen' },
 };
+for (const k in CH) CH[k].s = Math.sign(CH[k].door);
+const STORES = ['F1', 'F2'], NESTS = ['N1', 'N2'];
 function floorPt(ch, u, lift = 0) {
   return { x: ch.cx + u * ch.rx, y: ch.cy + ch.ry * Math.sqrt(Math.max(0, 1 - u * u)) - lift };
 }
 function floorY(ch, x) { const u = (x - ch.cx) / ch.rx; return ch.cy + ch.ry * Math.sqrt(Math.max(0, 1 - u * u)); }
-const AS = 1.75; // ant drawing scale
-const LIFT = 6 * AS; // ant body centre above the floor
-const N = {
-  E: { x: 800, y: SURF - LIFT },
-  A: { x: 815, y: 362 },
-  F: floorPt(CH.F, CH.F.door, LIFT),
-  B: { x: 878, y: 548 },
-  N: floorPt(CH.N, CH.N.door, LIFT),
-  C: { x: 772, y: 724 },
-  Q: floorPt(CH.Q, CH.Q.door, LIFT),
-};
-const EDGES = [['E', 'A'], ['A', 'F'], ['A', 'B'], ['B', 'N'], ['B', 'C'], ['C', 'Q']];
+const N = { E: { x: 800, y: SURF - LIFT }, A: { x: 812, y: 345 }, B: { x: 838, y: 560 }, C: { x: 792, y: 770 } };
+for (const k in CH) N[k] = floorPt(CH[k], CH[k].door, LIFT);
+const EDGES = [['E', 'A'], ['A', 'F1'], ['A', 'F2'], ['A', 'B'], ['B', 'N1'], ['B', 'N2'], ['B', 'C'], ['C', 'Q']];
 const ADJ = {}; for (const k in N) ADJ[k] = [];
 for (const [a, b] of EDGES) { ADJ[a].push(b); ADJ[b].push(a); }
 function route(a, b) {
@@ -60,7 +63,7 @@ function route(a, b) {
   while (q.length) { const n = q.shift(); if (n === b) break; for (const m of ADJ[n]) if (!(m in prev)) { prev[m] = n; q.push(m); } }
   const r = []; for (let n = b; n != null; n = prev[n]) r.unshift(n); return r;
 }
-// A "loc" is where an ant can stand: {node:'F',u} on a chamber floor, {node:'E',sx} on
+// A "loc" is where an ant can stand: {node:'F1',u} on a chamber floor, {node:'E',sx} on
 // the surface, or {node:'A'} at a tunnel bend.
 function locPt(loc) {
   if (loc.u != null) return floorPt(CH[loc.node], loc.u, LIFT);
@@ -90,86 +93,92 @@ function buildPath(loc, dest) {
 }
 
 // ---- Canvas / view -------------------------------------------------------
+// On touch devices held in portrait we draw the scene rotated, so it is always
+// landscape: turn the phone sideways and it fills the screen.
 const cv = document.getElementById('c'), g = cv.getContext('2d');
-let cw, chh, dpr, scale, offX, offY, visL, visR, visT, visB, bg;
+let ROT = false, cw, chh, dpr, scale, offX, offY, visL, visR, visT, visB, bg;
+function setT(ctx, a, b, c, d, e, f) {
+  if (!ROT) ctx.setTransform(a * dpr, b * dpr, c * dpr, d * dpr, e * dpr, f * dpr);
+  else ctx.setTransform(-b * dpr, a * dpr, -d * dpr, c * dpr, (chh - f) * dpr, e * dpr);
+}
+const screenT = ctx => setT(ctx, 1, 0, 0, 1, 0, 0);
+const worldT = ctx => setT(ctx, scale, 0, 0, scale, offX, offY);
 function resize() {
   dpr = Math.min(2, window.devicePixelRatio || 1);
-  cw = innerWidth; chh = innerHeight;
-  cv.width = Math.round(cw * dpr); cv.height = Math.round(chh * dpr);
-  scale = Math.min(chh / H, cw / 1300);
-  offX = cw / 2 - 915 * scale;
-  offY = (chh - H * scale) * 0.6;
+  const w0 = innerWidth, h0 = innerHeight;
+  ROT = COARSE && h0 > w0;
+  cw = ROT ? h0 : w0; chh = ROT ? w0 : h0;
+  cv.width = Math.round(w0 * dpr); cv.height = Math.round(h0 * dpr);
+  scale = Math.min(chh / (H - VIEW_TOP), cw / VIEW_W);
+  offX = cw / 2 - VIEW_CX * scale;
+  offY = -VIEW_TOP * scale + (chh - (H - VIEW_TOP) * scale) * 0.15;
   visL = -offX / scale; visR = (cw - offX) / scale; visT = -offY / scale; visB = (chh - offY) / scale;
   buildBg();
 }
-const worldT = () => g.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * offX, dpr * offY);
 
 // Static ground layer: dirt, pebbles, roots, then tunnels/chambers carved in.
 function buildBg() {
   bg = document.createElement('canvas'); bg.width = cv.width; bg.height = cv.height;
   const b = bg.getContext('2d'), R = mulberry(7);
-  b.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * offX, dpr * offY);
+  worldT(b);
   const L = visL - 20, Rr = visR + 20, B = visB + 20;
   const gr = b.createLinearGradient(0, SURF, 0, H);
   gr.addColorStop(0, '#9a6638'); gr.addColorStop(0.35, '#7d5030'); gr.addColorStop(1, '#4f3120');
   b.fillStyle = gr; b.fillRect(L, SURF, Rr - L, B - SURF);
-  // soft strata
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 8; i++) { // soft strata
     const y = SURF + 70 + i * 105 + R() * 40;
     b.fillStyle = `rgba(${R() < .5 ? '60,35,18' : '150,105,65'},0.10)`;
     b.beginPath(); b.moveTo(L, y);
     for (let x = L; x <= Rr; x += 80) b.lineTo(x, y + Math.sin(x * 0.006 + i) * 12);
     b.lineTo(Rr, y + 40); b.lineTo(L, y + 40); b.fill();
   }
-  // roots hanging from the grass
   b.lineCap = 'round';
-  for (let i = 0; i < 26; i++) {
+  for (let i = 0; i < 26; i++) { // roots hanging from the grass
     let x = L + R() * (Rr - L), y = SURF + 4; if (Math.abs(x - 800) < 60) continue;
     b.strokeStyle = `rgba(${200 + R() * 30 | 0},${170 + R() * 30 | 0},${120 + R() * 30 | 0},0.55)`;
     b.lineWidth = 1.2 + R() * 1.5;
     b.beginPath(); b.moveTo(x, y);
-    const len = 20 + R() * 60;
+    const len = 20 + R() * 45;
     for (let s = 0; s < len; s += 6) { x += (R() - 0.5) * 6; y += 6; b.lineTo(x, y); }
     b.stroke();
   }
-  // pebbles
-  for (let i = 0; i < 260; i++) {
+  for (let i = 0; i < 300; i++) { // pebbles
     const x = L + R() * (Rr - L), y = SURF + 14 + R() * (B - SURF);
     const r = 1.5 + R() * R() * 9, c = 90 + R() * 70 | 0;
     b.fillStyle = `rgba(${c + 20},${c},${c - 15},${0.35 + R() * 0.4})`;
     b.beginPath(); b.ellipse(x, y, r * 1.3, r, R() * 3, 0, 7); b.fill();
   }
-  // carve tunnels & chambers: rim, then interior
+  const TW = 44 * K; // tunnel width
   const carve = (w, col) => {
     b.strokeStyle = col; b.fillStyle = col; b.lineWidth = w;
     for (const [p, q] of EDGES) {
       const a = N[p], c = N[q];
       b.beginPath(); b.moveTo(a.x, a.y + 4); b.lineTo(c.x, c.y + 4); b.stroke();
     }
-    const pad = (w - 44) / 2;
+    const pad = (w - TW) / 2;
     for (const k in CH) { const c = CH[k]; b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 14 + pad, c.ry + 14 + pad, 0, 0, 7); b.fill(); }
   };
-  carve(56, '#5c3a22'); carve(44, '#2e1e13');
-  for (const k in CH) { // warm glow + floor tint
+  carve(TW + 12, '#5c3a22'); carve(TW, '#2e1e13');
+  for (const k in CH) { // warm glow + floor rim
     const c = CH[k], rg = b.createRadialGradient(c.cx, c.cy + 20, 10, c.cx, c.cy, c.rx + 20);
     rg.addColorStop(0, 'rgba(255,190,110,0.16)'); rg.addColorStop(1, 'rgba(255,190,110,0)');
     b.fillStyle = rg; b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 14, c.ry + 14, 0, 0, 7); b.fill();
     b.strokeStyle = 'rgba(120,80,50,0.5)'; b.lineWidth = 3;
     b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 12, c.ry + 12, 0, 0.15, Math.PI - 0.15); b.stroke();
   }
-  // top-soil band + graveyard patch + anthill mound
+  // top-soil band, graveyard patch, anthill mound
   b.fillStyle = '#6b4a2a'; b.fillRect(L, SURF - 1, Rr - L, 9);
   b.fillStyle = '#7a5a3c';
-  b.beginPath(); b.ellipse(1450, SURF + 2, 105, 9, 0, 0, 7); b.fill();
-  for (let i = 0; i < 30; i++) {
+  b.beginPath(); b.ellipse(1450, SURF + 2, 110, 9, 0, 0, 7); b.fill();
+  for (let i = 0; i < 34; i++) {
     b.fillStyle = `rgba(${150 + R() * 50 | 0},${130 + R() * 40 | 0},${100 + R() * 40 | 0},0.8)`;
-    b.beginPath(); b.ellipse(1355 + R() * 190, SURF - 1 + R() * 6, 1.5 + R() * 2.5, 1.2 + R() * 1.6, 0, 0, 7); b.fill();
+    b.beginPath(); b.ellipse(1350 + R() * 200, SURF - 1 + R() * 6, 1.5 + R() * 2.5, 1.2 + R() * 1.6, 0, 0, 7); b.fill();
   }
   b.fillStyle = '#a06c3c';
-  for (const s of [-1, 1]) { b.beginPath(); b.ellipse(800 + s * 36, SURF + 1, 28, 15, 0, Math.PI, 0); b.fill(); }
-  b.fillStyle = '#2e1e13'; b.beginPath(); b.ellipse(800, SURF + 2, 15, 7, 0, 0, 7); b.fill();
-  for (let i = 0; i < 40; i++) { // crumbs of dug-out soil on the mound
-    const a = R() * Math.PI, rr = 20 + R() * 40;
+  for (const s of [-1, 1]) { b.beginPath(); b.ellipse(800 + s * 40 * K, SURF + 1, 30 * K, 15 * K, 0, Math.PI, 0); b.fill(); }
+  b.fillStyle = '#2e1e13'; b.beginPath(); b.ellipse(800, SURF + 2, 17 * K, 8 * K, 0, 0, 7); b.fill();
+  for (let i = 0; i < 40; i++) {
+    const a = R() * Math.PI, rr = (20 + R() * 40) * K;
     b.fillStyle = `rgba(${170 + R() * 40 | 0},${115 + R() * 30 | 0},${60 + R() * 30 | 0},0.9)`;
     b.beginPath(); b.arc(800 + Math.cos(a) * rr * (R() < .5 ? -1 : 1), SURF - Math.sin(a) * 8 * R(), 1 + R() * 1.6, 0, 7); b.fill();
   }
@@ -178,11 +187,11 @@ function buildBg() {
 // ---- Scenery (sky, clouds, grass, flowers) ------------------------------
 const SR = mulberry(42);
 const stars = Array.from({ length: 90 }, () => ({ x: -900 + SR() * 3400, y: -1200 + SR() * (SURF + 1150), r: 0.6 + SR() * 1.4, p: SR() * 6 }));
-const clouds = Array.from({ length: 6 }, (_, i) => ({ x: SR() * 2400 - 400, y: 40 + SR() * 120, s: 0.6 + SR() * 0.8, v: 6 + SR() * 8 }));
+const clouds = Array.from({ length: 6 }, () => ({ x: SR() * 2400 - 400, y: 120 + SR() * 60, s: 0.45 + SR() * 0.5, v: 6 + SR() * 8 }));
 const blades = [];
 for (let x = -1400; x < 3000; x += 3.2 + SR() * 3) {
-  if (Math.abs(x - 800) < 62) continue;
-  const grave = x > 1350 && x < 1550;
+  if (Math.abs(x - 800) < 62 * K) continue;
+  const grave = x > 1345 && x < 1555;
   blades.push({ x, h: (grave ? 5 : 10) + SR() * (grave ? 7 : 22), lean: (SR() - 0.5) * 8, ph: SR() * 6, c: SR() * 4 | 0 });
 }
 const BLADE_COL = ['#3f9a3a', '#55b246', '#2f7f30', '#6cc350'];
@@ -207,43 +216,56 @@ function nightness(p) { // 0 = full day, 1 = full night
 }
 
 // ---- Simulation state ----------------------------------------------------
-const POP_CAP = 30, BROOD_CAP = 12, STORE_CAP = 48, NURSERY_SLOTS = 12;
-const slotU = i => -0.8 + i * 0.13;
-const qEggU = i => -0.9 + i * 0.075;
+const POP_CAP = 40, BROOD_CAP = 18, STORE_CAP = 36, NEST_SLOTS = 10;
+const slotU = (nest, i) => CH[nest].s * (0.78 - i * 0.15);
+const QS = CH.Q.s;                           // queen's door side; she faces the door
+const qEggU = i => -QS * (0.9 - i * 0.075);  // egg pile at the far end, behind her
 const FOOD = { seed: '#d9b46a', berry: '#d23a4e', crumb: '#f2d27c', leaf: '#6dbb4a', blue: '#5566d6' };
+const BLACK_BITE = [7, 11], RED_BITE = [18, 26];
 const S = {
   t: 0, day: 0.08,
-  ants: [], invaders: [], corpses: [], brood: [], store: [], food: [], parts: [],
-  queen: { u: 0.02, layT: 4, hunger: 0.5, claimed: false, pulse: 0 },
-  nextFood: 2, nextRaid: 35,
-  stats: { born: 0, died: 0, buried: 0, decomposed: 0, raids: 0, repelled: 0, foodIn: 0, fed: 0, eggs: 0 },
+  ants: [], invaders: [], corpses: [], brood: [], parts: [], food: [],
+  stores: { F1: [], F2: [] },
+  nest: { N1: new Array(NEST_SLOTS).fill(null), N2: new Array(NEST_SLOTS).fill(null) },
+  queen: { u: -QS * 0.04, layT: 4, hunger: 0.5, claimed: false, pulse: 0 },
+  nextFood: 2, nextRaid: 25,
+  stats: { born: 0, died: 0, buried: 0, decomposed: 0, raids: 0, redKilled: 0, redBuried: 0, retreats: 0, bites: 0, foodIn: 0, fed: 0, eggs: 0 },
 };
 let uid = 0;
+const storeTotal = () => S.stores.F1.length + S.stores.F2.length;
 
 class Ant {
   constructor(loc, age = 0, opts = {}) {
     this.id = uid++; this.loc = loc; const p = locPt(loc); this.x = p.x; this.y = p.y;
     this.path = []; this.f = Math.random() < .5 ? -1 : 1; this.tilt = 0; this.tiltT = 0;
     this.ph = rand(0, 6); this.age = age; this.life = opts.life || rand(220, 440);
-    this.job = null; this.carry = null; this.speed = opts.speed || rand(70, 88);
+    this.job = null; this.carry = null; this.speed = (opts.speed || rand(70, 88)) * Math.sqrt(K);
     this.mode = null; this.target = null; this.hop = 0; this.anim = null; this.moving = false;
-    this.red = !!opts.red; this.repathT = 0; this.jit = 0;
+    this.red = !!opts.red; this.jit = 0; this.dir = { x: 1, y: 0 };
+    this.hp = 100; this.biteT = rand(0.3, 1); this.lunge = 0; this.fighting = false;
   }
   move(dt, mult = 1) {
     let rem = this.speed * mult * dt * (this.carry ? 0.88 : 1);
     this.moving = this.path.length > 0;
     while (rem > 0 && this.path.length) {
       const t = this.path[0], dx = t.x - this.x, dy = t.y - this.y, d = Math.hypot(dx, dy);
-      if (d > 0.01) { if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx)); }
+      if (d > 0.01) { if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx)); this.dir = { x: dx / d, y: dy / d }; }
       if (d <= rem) { this.x = t.x; this.y = t.y; this.loc = t.loc; this.path.shift(); rem -= d; }
       else { this.x += dx / d * rem; this.y += dy / d * rem; rem = 0; }
     }
-    if (this.moving) this.ph += dt * this.speed * mult * 0.42;
+    if (this.moving) this.ph += dt * this.speed * mult * 0.42 / Math.sqrt(K);
   }
   moveDirect(tx, ty, dt, mult) {
     const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), s = Math.min(d, this.speed * mult * dt);
-    if (d > 0.5) { this.x += dx / d * s; this.y += dy / d * s; if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx)); this.ph += dt * this.speed * mult * 0.42; this.moving = true; }
+    if (d > 0.5) {
+      this.x += dx / d * s; this.y += dy / d * s;
+      if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx));
+      this.ph += dt * this.speed * mult * 0.42 / Math.sqrt(K); this.moving = true;
+      return false;
+    }
+    this.moving = false; return true;
   }
+  face(o) { const vx = o.x - this.x, vy = o.y - this.y; if (Math.abs(vx) > 0.5) this.f = vx > 0 ? 1 : -1; this.tiltT = Math.atan2(vy, Math.abs(vx) + 0.001); }
   runJob(dt) {
     const j = this.job;
     if (j && j.i == null) j.i = 0;
@@ -254,6 +276,7 @@ class Ant {
         if (this.path.length) { this.move(dt); return; }
         j.i++; continue;
       }
+      if (s.t === 'to') { const p = s.pt(); if (!this.moveDirect(p.x, p.y, dt, 0.7)) return; j.i++; continue; }
       if (s.t === 'wait') {
         this.moving = false;
         if (s.left == null) s.left = s.d;
@@ -271,68 +294,94 @@ class Ant {
 
 // ---- Jobs ----------------------------------------------------------------
 const go = dest => ({ t: 'go', dest: typeof dest === 'function' ? dest : () => dest });
+const to = pt => ({ t: 'to', pt });
 const wait = (d, anim) => ({ t: 'wait', d, anim });
 const doo = f => ({ t: 'do', f });
+const storeTakeU = id => CH[id].s * rand(0.25, 0.38);
+const storeDropU = id => CH[id].s * rand(0.35, 0.65);
+function takeStoreFor(near) { // nearest store that has food
+  const order = near === 'N1' ? ['F2', 'F1'] : near === 'N2' ? ['F1', 'F2'] : STORES.slice().sort((a, b) => S.stores[b].length - S.stores[a].length);
+  return order.find(id => S.stores[id].length) || null;
+}
+const nestOf = loc => (loc && NESTS.includes(loc.node)) ? loc.node : pick(NESTS);
 
 function idleJob(a) {
   const r = Math.random(); let dest, anim = 'groom';
-  if (a.age < 30 || r < 0.35) { dest = { node: 'N', u: rand(-0.78, 0.72) }; anim = 'tend'; }
-  else if (r < 0.55) dest = { node: 'F', u: rand(0.05, 0.75) };
-  else if (r < 0.7) dest = { node: 'Q', u: rand(0.5, 0.85) };
+  if (a.age < 30 || r < 0.35) { const n = pick(NESTS); dest = { node: n, u: rand(-0.75, 0.75) }; anim = 'tend'; }
+  else if (r < 0.55) { const s = pick(STORES); dest = { node: s, u: storeDropU(s) }; }
+  else if (r < 0.7) dest = { node: 'Q', u: QS * rand(0.45, 0.85) };
   else if (r < 0.85) dest = { node: 'E', sx: clamp(rand(450, 1250), visL + 40, Math.min(1330, visR - 40)) };
   else dest = { node: pick(['A', 'B', 'C']) };
   return { idle: true, steps: [go(dest), wait(rand(1.5, 4), anim)] };
 }
+function restJob(a) { // a hurt ant goes home to rest and heal
+  const n = pick(NESTS);
+  return { steps: [go({ node: n, u: rand(-0.6, 0.6) }), wait(rand(5, 8), 'groom')] };
+}
 function forageJob(a, item) {
   item.claims++;
-  let released = false; const rel = () => { if (!released) { released = true; item.claims--; } };
+  let released = false, store = null; const rel = () => { if (!released) { released = true; item.claims--; } };
   return {
     steps: [
       go(() => ({ node: 'E', sx: item.x + rand(-4, 4) })),
       wait(0.8, 'nibble'),
-      doo(() => { rel(); if (item.bites <= 0) return false; item.bites--; a.carry = { kind: 'food', type: item.type }; if (item.bites <= 0) S.food.splice(S.food.indexOf(item), 1); }),
-      go(() => ({ node: 'F', u: rand(0.2, 0.5) })),
+      doo(() => { rel(); if (item.bites <= 0) return false; item.bites--; a.carry = { kind: 'food', type: item.type }; if (item.bites <= 0) S.food.splice(S.food.indexOf(item), 1);
+        store = S.stores.F1.length === S.stores.F2.length ? pick(STORES) : S.stores.F1.length < S.stores.F2.length ? 'F1' : 'F2'; }),
+      go(() => ({ node: store, u: storeDropU(store) })),
       wait(0.5),
-      doo(() => { S.store.push(a.carry.type); S.stats.foodIn++; a.carry = null; sparkle(a.x + a.f * 18, a.y, 3); }),
+      doo(() => { S.stores[store].push(a.carry.type); S.stats.foodIn++; a.carry = null; sparkle(a.x + a.f * 18 * K, a.y, 3); }),
     ], abort: rel,
   };
 }
+function fetchFood(a, near) { // steps: walk to a store and pick up one food item
+  let store = null;
+  return [
+    doo(() => { store = takeStoreFor(near); if (!store) return false; }),
+    go(() => ({ node: store, u: storeTakeU(store) })),
+    doo(() => { if (!S.stores[store].length) return false; a.carry = { kind: 'food', type: S.stores[store].pop() }; }),
+  ];
+}
+function returnFood(a) { if (a.carry && a.carry.kind === 'food') { const s = takeStoreFor() || 'F1'; S.stores[s].push(a.carry.type); a.carry = null; } }
 function feedLarvaJob(a, larva) {
   larva.claimed = true; const rel = () => { larva.claimed = false; };
+  const n = larva.nest, s = CH[n].s;
   return {
     steps: [
-      go(() => ({ node: 'F', u: rand(0.08, 0.28) })),
-      doo(() => { if (!S.store.length) return false; a.carry = { kind: 'food', type: S.store.pop() }; }),
-      go(() => ({ node: 'N', u: slotU(larva.slot) + 0.09 })),
-      doo(() => { a.f = -1; }),
+      ...fetchFood(a, n),
+      go(() => ({ node: n, u: slotU(n, larva.slot) - s * 0.09 })),
+      doo(() => { a.f = s; }),
       wait(1.6, 'feed'),
-      doo(() => { larva.fed++; larva.since = 0; a.carry = null; rel(); S.stats.fed++; hearts(larva.x, larva.y - 14, 3); }),
-    ], abort: () => { rel(); if (a.carry) { S.store.push(a.carry.type); a.carry = null; } },
+      doo(() => { larva.fed++; larva.since = 0; a.carry = null; rel(); S.stats.fed++; hearts(larva.x, larva.y - 14 * K, 3); }),
+    ], abort: () => { rel(); returnFood(a); },
   };
 }
 function feedQueenJob(a) {
   const q = S.queen; q.claimed = true; const rel = () => { q.claimed = false; };
   return {
     steps: [
-      go(() => ({ node: 'F', u: rand(0.08, 0.28) })),
-      doo(() => { if (!S.store.length) return false; a.carry = { kind: 'food', type: S.store.pop() }; }),
-      go(() => ({ node: 'Q', u: q.u + 0.42 })),
-      doo(() => { a.f = -1; }),
+      ...fetchFood(a, 'Q'),
+      go(() => ({ node: 'Q', u: q.u + QS * 0.42 * K })),
+      doo(() => { a.f = -QS; }),
       wait(2, 'feed'),
-      doo(() => { q.hunger = 0; a.carry = null; rel(); const p = floorPt(CH.Q, q.u + 0.25, 50); hearts(p.x, p.y, 5); }),
-    ], abort: () => { rel(); if (a.carry) { S.store.push(a.carry.type); a.carry = null; } },
+      doo(() => { q.hunger = 0; a.carry = null; rel(); const p = floorPt(CH.Q, q.u + QS * 0.25 * K, 50 * K); hearts(p.x, p.y, 5); }),
+    ], abort: () => { rel(); returnFood(a); },
   };
 }
+function freeSlot() {
+  const free = [];
+  for (const n of NESTS) S.nest[n].forEach((b, i) => { if (!b) free.push([n, i]); });
+  return free.length ? pick(free) : null;
+}
 function eggJob(a, egg) {
-  egg.claimed = true; let slot = -1;
+  egg.claimed = true; let spot = null;
   return {
     steps: [
-      go(() => ({ node: 'Q', u: qEggU(egg.slot) + 0.1 })),
-      doo(() => { a.f = -1; slot = freeNurserySlot(); if (slot < 0) return false; egg.where = 'carried'; egg.slot = -1; a.carry = { kind: 'egg', b: egg }; nurseryTaken[slot] = egg; }),
-      go(() => ({ node: 'N', u: slotU(slot) + 0.09 })),
-      doo(() => { a.f = -1; }),
+      go(() => ({ node: 'Q', u: qEggU(egg.slot) + QS * 0.1 })),
+      doo(() => { a.f = -QS; spot = freeSlot(); if (!spot) return false; egg.where = 'carried'; egg.slot = -1; a.carry = { kind: 'egg', b: egg }; S.nest[spot[0]][spot[1]] = egg; }),
+      go(() => ({ node: spot[0], u: slotU(spot[0], spot[1]) - CH[spot[0]].s * 0.09 })),
+      doo(() => { a.f = CH[spot[0]].s; }),
       wait(0.6, 'feed'),
-      doo(() => { egg.where = 'nursery'; egg.slot = slot; egg.t = 0; egg.claimed = false; a.carry = null; sparkle(egg.x, egg.y, 3); }),
+      doo(() => { egg.where = 'nursery'; egg.nest = spot[0]; egg.slot = spot[1]; egg.t = 0; egg.claimed = false; a.carry = null; sparkle(egg.x, egg.y, 3); }),
     ], abort: () => { egg.claimed = false; },
   };
 }
@@ -341,30 +390,32 @@ function buryJob(a, c) {
   return {
     steps: [
       go(() => c.loc),
+      to(() => ({ x: c.x - (c.x > a.x ? 1 : -1) * 16 * K, y: c.y - 3 * K })),
       wait(0.6, 'nibble'),
       doo(() => { c.state = 'carried'; a.carry = { kind: 'corpse', c }; }),
-      go(() => ({ node: 'E', sx: rand(1375, 1525) })),
+      go(() => ({ node: 'E', sx: rand(1370, 1530) })),
       wait(0.5),
-      doo(() => { c.state = 'grave'; c.x = a.x + a.f * 24; c.y = SURF - 5; c.decay = 0; a.carry = null; S.stats.buried++; }),
+      doo(() => { c.state = 'grave'; c.x = a.x + a.f * 24 * K; c.y = SURF - 5; c.decay = 0; a.carry = null; S.stats.buried++; if (c.red) S.stats.redBuried++; }),
     ], abort: () => { c.claimed = false; },
   };
 }
-const nurseryTaken = new Array(NURSERY_SLOTS).fill(null);
-function freeNurserySlot() { const free = []; for (let i = 0; i < NURSERY_SLOTS; i++) if (!nurseryTaken[i]) free.push(i); return free.length ? pick(free) : -1; }
 
 function chooseJob(a) {
   const q = S.queen, grown = a.age > 35;
   const corpse = S.corpses.find(c => c.state === 'lying' && !c.claimed);
-  if (corpse && grown && Math.random() < 0.7) return buryJob(a, corpse);
+  if (corpse && grown && Math.random() < 0.75) return buryJob(a, corpse);
   const egg = S.brood.find(b => b.where === 'queen' && !b.claimed);
-  if (egg && Math.random() < 0.75 && freeNurserySlot() >= 0) return eggJob(a, egg);
-  if (S.store.length && q.hunger > 1 && !q.claimed && Math.random() < 0.8) return feedQueenJob(a);
+  if (egg && Math.random() < 0.75 && freeSlot()) return eggJob(a, egg);
+  if (storeTotal() && q.hunger > 1 && !q.claimed && Math.random() < 0.8) return feedQueenJob(a);
   const hungry = S.brood.filter(b => b.stage === 'larva' && b.where === 'nursery' && b.hungry && !b.claimed);
-  if (hungry.length && S.store.length && Math.random() < 0.8) return feedLarvaJob(a, pick(hungry));
-  if (grown && S.store.length < STORE_CAP - 4) {
+  if (hungry.length && storeTotal() && Math.random() < 0.8) {
+    const near = hungry.filter(b => b.nest === nestOf(a.loc));
+    return feedLarvaJob(a, pick(near.length ? near : hungry));
+  }
+  if (grown && storeTotal() < STORE_CAP * 2 - 6) {
     const foragers = S.ants.filter(x => x.carry && x.carry.kind === 'food').length;
     const avail = S.food.filter(f => f.bites - f.claims > 0);
-    if (avail.length && foragers < 12 && Math.random() < 0.75) {
+    if (avail.length && foragers < 14 && Math.random() < 0.75) {
       avail.sort((p, r) => Math.abs(p.x - a.x) - Math.abs(r.x - a.x));
       return forageJob(a, avail[Math.random() < 0.7 ? 0 : avail.length - 1]);
     }
@@ -377,42 +428,40 @@ function hearts(x, y, n) { for (let i = 0; i < n; i++) S.parts.push({ k: 'heart'
 function sparkle(x, y, n) { for (let i = 0; i < n; i++) S.parts.push({ k: 'spark', x: x + rand(-8, 8), y: y + rand(-8, 4), vx: rand(-10, 10), vy: rand(-20, -5), life: 0.9, age: 0, s: rand(0.7, 1.3) }); }
 function starBurst(x, y, n) { for (let i = 0; i < n; i++) { const a = rand(-Math.PI, 0); S.parts.push({ k: 'star', x, y, vx: Math.cos(a) * rand(20, 45), vy: Math.sin(a) * rand(20, 45), life: 0.9, age: 0, s: rand(0.7, 1.2), r: rand(0, 6) }); } }
 function puff(x, y) { S.parts.push({ k: 'puff', x: x + rand(-8, 8), y: y + rand(-6, 4), vx: rand(-6, 6), vy: rand(-10, -2), life: 0.7, age: 0, s: rand(0.6, 1.2) }); }
+function chomp(x, y) { S.parts.push({ k: 'chomp', x, y, vx: 0, vy: -12, life: 0.45, age: 0, s: 1 }); }
 
 // ---- Lifecycle -----------------------------------------------------------
-function placeQueenEgg() {
-  const used = new Set(S.brood.filter(b => b.where === 'queen').map(b => b.slot));
-  for (let i = 0; i < 5; i++) if (!used.has(i)) return i;
-  return -1;
-}
 function updateQueen(dt) {
   const q = S.queen;
   q.hunger += dt / 28; q.pulse = Math.max(0, q.pulse - dt);
   q.layT -= dt;
   if (q.layT <= 0) {
-    const slot = placeQueenEgg(), pop = S.ants.length + S.brood.length;
+    const used = new Set(S.brood.filter(b => b.where === 'queen').map(b => b.slot));
+    let slot = -1; for (let i = 0; i < 5; i++) if (!used.has(i)) { slot = i; break; }
+    const pop = S.ants.length + S.brood.length;
     if (slot >= 0 && S.brood.length < BROOD_CAP && pop < POP_CAP) {
-      S.brood.push({ id: uid++, stage: 'egg', where: 'queen', slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6) });
+      S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6) });
       q.pulse = 0.8; S.stats.eggs++;
       const p = floorPt(CH.Q, qEggU(slot), 4); sparkle(p.x, p.y - 4, 4);
     }
-    q.layT = S.ants.length < 12 ? rand(3, 5) : rand(7, 12);
+    q.layT = S.ants.length < 14 ? rand(3, 5) : rand(6, 10);
   }
 }
 function updateBrood(dt) {
   for (let i = S.brood.length - 1; i >= 0; i--) {
     const b = S.brood[i];
-    if (b.where === 'queen') { const p = floorPt(CH.Q, qEggU(b.slot), 3); b.x = p.x; b.y = p.y - (b.slot % 2) * 5; continue; }
+    if (b.where === 'queen') { const p = floorPt(CH.Q, qEggU(b.slot), 3); b.x = p.x; b.y = p.y - (b.slot % 2) * 5 * K; continue; }
     if (b.where !== 'nursery') continue;
-    const p = floorPt(CH.N, slotU(b.slot), 4); b.x = p.x; b.y = p.y;
+    const p = floorPt(CH[b.nest], slotU(b.nest, b.slot), 4); b.x = p.x; b.y = p.y;
     b.t += dt; b.since += dt;
     if (b.stage === 'egg' && b.t > 16) { b.stage = 'larva'; b.t = 0; b.since = 4; sparkle(b.x, b.y, 2); }
     else if (b.stage === 'larva') {
       b.hungry = b.fed < 3 && b.since > 5;
       if (b.fed >= 3 && b.since > 6 && !b.claimed) { b.stage = 'pupa'; b.t = 0; b.hungry = false; }
     } else if (b.stage === 'pupa' && b.t > 18) {
-      S.brood.splice(i, 1); nurseryTaken[b.slot] = null;
-      const a = new Ant({ node: 'N', u: slotU(b.slot) }, 0);
-      a.y -= 2; a.hop = 0.5; S.ants.push(a); S.stats.born++;
+      S.brood.splice(i, 1); S.nest[b.nest][b.slot] = null;
+      const a = new Ant({ node: b.nest, u: slotU(b.nest, b.slot) }, 0);
+      a.hop = 0.5; S.ants.push(a); S.stats.born++;
       sparkle(b.x, b.y - 6, 8);
     }
   }
@@ -421,74 +470,104 @@ function updateFood(dt) {
   S.nextFood -= dt;
   const night = nightness(S.day);
   if (S.nextFood <= 0) {
-    S.nextFood = rand(4, 8) * (night > 0.5 ? 2.5 : 1);
+    S.nextFood = rand(4, 7) * (night > 0.5 ? 2.5 : 1);
     if (S.food.length < 6) {
-      const lo = Math.max(60, visL + 40), hi = Math.min(1320, visR - 40);
+      const lo = Math.max(60, visL + 50), hi = Math.min(1320, visR - 50);
       let x, tries = 0;
-      do { x = rand(lo, hi); tries++; } while ((Math.abs(x - 800) < 80 || S.food.some(f => Math.abs(f.x - x) < 50)) && tries < 20);
+      do { x = rand(lo, hi); tries++; } while ((Math.abs(x - 800) < 90 || S.food.some(f => Math.abs(f.x - x) < 60)) && tries < 20);
       const type = pick(Object.keys(FOOD)), bites = 2 + Math.floor(Math.random() * 5);
       S.food.push({ x, type, bites, max: bites, claims: 0, born: S.t, rot: rand(-0.6, 0.6) });
     }
   }
 }
+
+// ---- Red raiders & fighting ------------------------------------------------
+// Red ants walk in from the edge of the screen and head for a food store. Up to four
+// black ants gang up on each one. Every bite takes some health: black bites are weaker,
+// so it takes several black ants to beat one red ant. A black ant that gets badly hurt
+// goes home to rest and heal (black ants never die in a fight). A defeated red ant is
+// carried to the graveyard like any other.
+function attackersOf(r) { return S.ants.filter(a => a.target === r); }
+function spawnRaid() {
+  const n = Math.random() < 0.55 ? 1 : Math.random() < 0.75 ? 2 : 3;
+  const side = Math.random() < 0.5 ? -1 : 1;
+  S.stats.raids++;
+  for (let i = 0; i < n; i++) {
+    const sx = side < 0 ? visL - 30 * K - i * 50 * K : visR + 30 * K + i * 50 * K;
+    const r = new Ant({ node: 'E', sx }, 100, { red: true, speed: rand(58, 66) });
+    r.side = side; r.f = -side; r.dir = { x: -side, y: 0 };
+    const st = pick(STORES);
+    r.path = buildPath(r.loc, { node: st, u: storeDropU(st) });
+    S.invaders.push(r);
+  }
+}
+function killRed(r) {
+  S.invaders.splice(S.invaders.indexOf(r), 1); r.gone = true; S.stats.redKilled++;
+  starBurst(r.x, r.y - 20 * K, 8);
+  S.corpses.push({ id: r.id, red: true, x: r.x, y: r.y + 5 * K, f: r.f, loc: r.path.length ? r.path[0].loc : r.loc, state: 'lying', claimed: false, decay: 0 });
+}
 function updateRaids(dt) {
   S.nextRaid -= dt;
-  if (S.nextRaid <= 0) {
-    S.nextRaid = rand(65, 130);
-    const n = Math.random() < 0.45 ? 1 : Math.random() < 0.7 ? 2 : 3;
-    const side = Math.random() < 0.5 ? -1 : 1;
-    S.stats.raids++;
-    for (let i = 0; i < n; i++) {
-      const sx = side < 0 ? visL - 30 - i * 40 : visR + 30 + i * 40;
-      const r = new Ant({ node: 'E', sx }, 100, { red: true, speed: rand(60, 68) });
-      r.side = side; r.f = -side; r.fightT = null; r.fleeing = false;
-      r.path = buildPath(r.loc, { node: 'F', u: rand(-0.1, 0.3) });
-      S.invaders.push(r);
-    }
-  }
-  for (let i = S.invaders.length - 1; i >= 0; i--) {
-    const r = S.invaders[i];
-    if (r.fleeing) {
-      r.move(dt, 1.7);
-      if (!r.path.length) { S.invaders.splice(i, 1); r.gone = true; }
-      continue;
-    }
-    if (r.fightT != null) {
-      r.fightT -= dt; r.moving = false; r.jit += dt;
-      if (Math.random() < dt * 9) puff(r.x, r.y + 4);
-      if (Math.random() < dt * 4) starBurst(r.x, r.y - 18, 1);
-      if (r.fightT <= 0) {
-        r.fleeing = true; S.stats.repelled++; starBurst(r.x, r.y - 20, 6);
-        r.path = buildPath(r.path.length ? r.path[0].loc : r.loc, { node: 'E', sx: r.side < 0 ? visL - 80 : visR + 80 });
+  if (S.nextRaid <= 0) { S.nextRaid = rand(50, 100); spawnRaid(); }
+  for (const r of S.invaders.slice()) {
+    r.lunge = Math.max(0, r.lunge - dt);
+    const fighters = attackersOf(r).filter(a => a.fighting);
+    if (fighters.length) {
+      r.moving = false; r.jit += dt;
+      if (Math.random() < dt * 5) puff(r.x, r.y + 4);
+      r.biteT -= dt;
+      if (r.biteT <= 0) { // red bites one of the black ants
+        r.biteT = rand(0.7, 1.0);
+        const v = pick(fighters); r.face(v); r.lunge = 0.15;
+        v.hp -= rand(...RED_BITE); S.stats.bites++;
+        chomp((r.x + v.x) / 2, (r.y + v.y) / 2 - 8 * K);
+        if (v.hp <= 25) retreat(v);
       }
-      continue;
+    } else {
+      r.move(dt);
     }
-    r.move(dt);
-    // assign up to 2 defenders, nearest first
-    const defenders = S.ants.filter(a => a.target === r).length;
-    if (defenders < 2) {
+    // assign up to four defenders, nearest first
+    let defs = attackersOf(r).length;
+    while (defs < 4) {
       let best = null, bd = 1e9;
-      for (const a of S.ants) if (a.interruptible && a.age > 20) { const d = dist(a, r); if (d < bd) { bd = d; best = a; } }
-      if (best) { best.abort(); best.mode = 'defend'; best.target = r; best.goalKey = null; best.fighting = false; }
+      for (const a of S.ants) if (a.interruptible && a.age > 20 && a.hp >= 70) { const d = dist(a, r); if (d < bd) { bd = d; best = a; } }
+      if (!best) break;
+      best.abort(); best.mode = 'defend'; best.target = r; best.goalKey = null; best.fighting = false; defs++;
     }
   }
 }
+function retreat(a) {
+  a.mode = null; a.target = null; a.fighting = false; a.path = []; a.moving = false;
+  a.job = restJob(a); S.stats.retreats++;
+}
 function updateDefender(a, dt) {
   const r = a.target;
-  if (!r || r.fleeing || r.gone) {
+  if (!r || r.gone) {
     a.mode = null; a.target = null; a.path = []; a.fighting = false; a.hop = 0.6; a.moving = false;
     a.idleT = rand(0.4, 1.2);
     return;
   }
   const d = dist(a, r);
-  if (a.fighting || d < 38) {
-    if (!a.fighting) { a.fighting = true; a.loc = r.path.length ? r.path[0].loc : r.loc; }
-    if (r.fightT == null) { r.fightT = rand(3, 4.5); r.f = a.x < r.x ? -1 : 1; }
-    a.f = r.x > a.x ? 1 : -1; a.moving = true; a.ph += dt * 30; a.jit += dt;
-    if (d > 32) a.moveDirect(r.x - a.f * 28, r.y, dt, 1);
+  if (!a.fighting && d < 42 * K) { // join the scuffle on whichever side we arrived
+    a.fighting = true; a.loc = r.path.length ? r.path[0].loc : r.loc;
+    const side = Math.sign((a.x - r.x) * r.dir.x + (a.y - r.y) * r.dir.y) || 1;
+    a.side = side; a.tier = attackersOf(r).filter(o => o !== a && o.fighting && o.side === side).length;
+  }
+  if (a.fighting) {
+    const off = (30 + a.tier * 20) * K * a.side;
+    const tx = r.x + r.dir.x * off, ty = r.y + r.dir.y * off;
+    if (Math.hypot(tx - a.x, ty - a.y) > 2) a.moveDirect(tx, ty, dt, 1);
+    a.face(r); a.jit += dt; a.moving = true; a.ph += dt * 10;
+    a.biteT -= dt;
+    if (a.biteT <= 0 && a.tier < 2) { // the two closest on each side can bite
+      a.biteT = rand(0.8, 1.2); a.lunge = 0.15;
+      r.hp -= rand(...BLACK_BITE); S.stats.bites++;
+      chomp((r.x + a.x) / 2, (r.y + a.y) / 2 - 8 * K);
+      if (r.hp <= 0) killRed(r);
+    }
     return;
   }
-  if (d < 70) { a.moveDirect(r.x, r.y, dt, 1.3); a.loc = r.path.length ? r.path[0].loc : r.loc; return; }
+  if (d < 80 * K) { a.moveDirect(r.x, r.y, dt, 1.3); a.loc = r.path.length ? r.path[0].loc : r.loc; return; }
   const goal = r.path.length ? r.path[0].loc : r.loc, key = JSON.stringify(goal);
   if (key !== a.goalKey || !a.path.length) { a.goalKey = key; a.path = buildPath(a.path.length ? a.path[0].loc : a.loc, goal); }
   a.move(dt, 1.3);
@@ -496,15 +575,15 @@ function updateDefender(a, dt) {
 function updateAnts(dt) {
   for (let i = S.ants.length - 1; i >= 0; i--) {
     const a = S.ants[i];
-    a.age += dt; a.hop = Math.max(0, a.hop - dt);
+    a.age += dt; a.hop = Math.max(0, a.hop - dt); a.lunge = Math.max(0, a.lunge - dt);
+    if (!a.fighting && a.hp < 100) a.hp = Math.min(100, a.hp + dt * (a.mode ? 2 : 6));
     if (a.mode === 'defend') { updateDefender(a, dt); continue; }
     if (a.job) { a.runJob(dt); continue; }
     a.moving = false;
-    // old age: only when resting, and never if the colony is small
-    if (a.age > a.life) {
-      if (S.ants.length > 12) {
+    if (a.age > a.life) { // old age: only when resting, and never if the colony is small
+      if (S.ants.length > 14) {
         S.ants.splice(i, 1); S.stats.died++;
-        S.corpses.push({ id: a.id, x: a.x, y: a.y + 5, f: a.f, loc: a.loc, state: 'lying', claimed: false, decay: 0 });
+        S.corpses.push({ id: a.id, x: a.x, y: a.y + 5 * K, f: a.f, loc: a.loc, state: 'lying', claimed: false, decay: 0 });
         continue;
       }
       a.life += 60;
@@ -538,7 +617,7 @@ const ANT_BLACK = '#1d1b20', ANT_RED = '#c0341f';
 function leg(hx, kx, fx, ph, mv, dead) {
   const sw = mv * Math.sin(ph) * 2.6, lift = mv * Math.max(0, Math.cos(ph)) * 1.8;
   g.beginPath(); g.moveTo(hx, 0.5);
-  if (dead) { const w = Math.sin(S.t * 0) * 0; g.lineTo(hx + kx * 0.6, -1.5); g.lineTo(hx + fx * 0.35 + w, 3.5); }
+  if (dead) { g.lineTo(hx + kx * 0.6, -1.5); g.lineTo(hx + fx * 0.35, 3.5); }
   else { g.lineTo(hx + kx, -2.4); g.lineTo(hx + fx + sw, 6 - lift); }
   g.stroke();
 }
@@ -546,14 +625,13 @@ function drawAnt(x, y, o) {
   g.save(); g.translate(x, y);
   if (o.alpha != null) g.globalAlpha *= o.alpha;
   g.scale(o.f * o.s, o.s); g.rotate(o.tilt || 0);
+  if (o.lunge) g.translate(o.lunge * 20, 0);
   if (o.dead) { g.translate(0, -1); g.scale(1, -1); }
   const ph = o.ph || 0, mv = o.moving ? 1 : 0, col = o.col, dead = o.dead;
   const qn = !!o.queen;
   g.lineCap = 'round'; g.lineJoin = 'round';
-  // far legs (slightly lighter so they read as "behind")
-  g.strokeStyle = o.farCol || col; g.lineWidth = 1.25;
+  g.strokeStyle = o.farCol || col; g.lineWidth = 1.25; // far legs
   leg(-0.5, -3, -6.5, ph + Math.PI, mv, dead); leg(1.5, 0.5, 1, ph, mv, dead); leg(3.3, 3, 6.5, ph + Math.PI, mv, dead);
-  // body
   const bob = o.anim === 'feed' ? Math.sin(S.t * 14) * 0.8 : 0;
   g.fillStyle = col;
   const ax = qn ? -12.5 : -8, arx = qn ? 10 : 6.2, ary = qn ? 6.6 : 4.6;
@@ -563,41 +641,36 @@ function drawAnt(x, y, o) {
   g.beginPath(); g.ellipse(-2.2, -0.6, 1.8, 1.5, 0, 0, 7); g.fill();
   g.beginPath(); g.ellipse(1.5, -1.2, 4, 2.6, -0.15, 0, 7); g.fill();
   g.beginPath(); g.ellipse(7.8 + bob, -2.4, 3.5, 3.1, 0.1, 0, 7); g.fill();
-  // shine
-  g.fillStyle = 'rgba(255,255,255,0.20)';
+  g.fillStyle = 'rgba(255,255,255,0.20)'; // shine
   g.beginPath(); g.ellipse(ax + 1, -1.2 - ary * 0.5, arx * 0.5, ary * 0.25, -0.12, 0, 7); g.fill();
-  // cute eye
-  if (!dead) {
+  if (!dead) { // cute eye
     g.fillStyle = '#fff'; g.beginPath(); g.arc(9 + bob, -3.3, 1.35, 0, 7); g.fill();
     g.fillStyle = '#111'; g.beginPath(); g.arc(9.45 + bob, -3.2, 0.7, 0, 7); g.fill();
   } else {
     g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 0.5;
     g.beginPath(); g.moveTo(8.3, -4); g.lineTo(9.7, -2.6); g.moveTo(9.7, -4); g.lineTo(8.3, -2.6); g.stroke();
   }
-  // antennae + mandible
-  g.strokeStyle = col; g.lineWidth = 0.95;
+  g.strokeStyle = col; g.lineWidth = 0.95; // antennae + mandible
   const wig = o.anim === 'groom' || o.anim === 'tend' ? Math.sin(S.t * 9 + ph) * 1.6 : Math.sin(S.t * 3 + ph) * 0.8;
-  const ant2 = dead ? -1 : 1;
-  g.beginPath(); g.moveTo(9 + bob, -5); g.lineTo(10 + bob, -9.5 * ant2 + (dead ? 0 : 0)); g.lineTo(14.5 + bob, -8 + wig); g.stroke();
+  g.beginPath(); g.moveTo(9 + bob, -5); g.lineTo(10 + bob, dead ? 9.5 : -9.5); g.lineTo(14.5 + bob, -8 + wig); g.stroke();
   g.beginPath(); g.moveTo(8.4 + bob, -5); g.lineTo(8.6 + bob, -9.8); g.lineTo(13 + bob, -9.3 - wig * 0.7); g.stroke();
   g.lineWidth = o.red ? 1.4 : 1.1;
-  g.beginPath(); g.moveTo(10.8 + bob, -1); g.quadraticCurveTo(13 + bob, -0.6, 12.6 + bob, 1.2); g.stroke();
+  const open = o.lunge ? 1.2 : 0;
+  g.beginPath(); g.moveTo(10.8 + bob, -1); g.quadraticCurveTo(13 + bob, -0.6 - open, 12.6 + bob, 1.2 - open); g.stroke();
   if (qn) { // little crown
     g.fillStyle = '#ffcc33'; g.strokeStyle = '#c99712'; g.lineWidth = 0.4;
     g.beginPath(); g.moveTo(5.2, -5); g.lineTo(5.4, -8.6); g.lineTo(6.8, -6.6); g.lineTo(7.9, -9.3); g.lineTo(9, -6.6); g.lineTo(10.4, -8.6); g.lineTo(10.6, -5); g.closePath(); g.fill(); g.stroke();
     g.fillStyle = '#ff5a7a'; g.beginPath(); g.arc(7.9, -6.3, 0.6, 0, 7); g.fill();
   }
-  // near legs
-  g.strokeStyle = col; g.lineWidth = 1.45;
+  g.strokeStyle = col; g.lineWidth = 1.45; // near legs
   leg(-0.5, -3, -6.5, ph, mv, dead); leg(1.5, 0.5, 1, ph + Math.PI, mv, dead); leg(3.3, 3, 6.5, ph, mv, dead);
-  // carried thing, held in the mandibles
   if (o.carry) drawCarry(o.carry, 14 + bob, -1);
   g.restore();
 }
 function drawCarry(c, x, y) {
-  if (c.kind === 'food') drawFoodBit(c.type, x + 2, y, 3.4);
+  if (c.kind === 'food') drawFoodBit(c.type, x + 2, y, 3.4 * Math.sqrt(K));
   else if (c.kind === 'egg') drawEgg(x + 3, y, 1);
-  else if (c.kind === 'corpse') drawAnt(x + 9, y - 3, { f: 1, s: 0.8, col: ANT_BLACK, dead: true, tilt: 0.25 });
+  else if (c.kind === 'corpse') drawAnt(x + 9, y - 3, { f: 1, s: 0.8, col: c.c.red ? '#9a3020' : ANT_BLACK, dead: true, tilt: 0.25 });
 }
 function drawFoodBit(type, x, y, r, rot = 0) {
   g.save(); g.translate(x, y); g.rotate(rot);
@@ -622,28 +695,26 @@ function drawEgg(x, y, s) {
   g.fillStyle = 'rgba(255,255,255,0.9)'; g.beginPath(); g.arc(x - 1 * s, y - 0.9 * s, 0.8 * s, 0, 7); g.fill();
 }
 function drawLarva(b) {
-  const sz = (0.9 + b.fed * 0.17) * 1.7, w = Math.sin(S.t * (b.hungry ? 7 : 2) + b.wig) * (b.hungry ? 0.18 : 0.06);
+  const sz = (0.9 + b.fed * 0.17) * 1.7 * K, w = Math.sin(S.t * (b.hungry ? 7 : 2) + b.wig) * (b.hungry ? 0.18 : 0.06);
   g.save(); g.translate(b.x, b.y - 4 * sz); g.scale(sz, sz); g.rotate(w);
   g.fillStyle = '#f6edd3'; g.strokeStyle = 'rgba(190,160,110,0.8)'; g.lineWidth = 0.6;
   for (let k = 0; k < 7; k++) { // curled C of segments
     const a = Math.PI * 0.15 + k * 0.38, r = 4.2 - k * 0.25;
-    const px = Math.cos(a) * 4.5, py = -Math.sin(a) * 3.2 + 1;
-    g.beginPath(); g.arc(px, py, r * 0.75, 0, 7); g.fill(); g.stroke();
+    g.beginPath(); g.arc(Math.cos(a) * 4.5, -Math.sin(a) * 3.2 + 1, r * 0.75, 0, 7); g.fill(); g.stroke();
   }
   g.fillStyle = '#3a2a1a'; g.beginPath(); g.arc(4.5, 0.2, 0.55, 0, 7); g.fill();
   g.restore();
   if (b.hungry) { // thought bubble with a crumb
-    const bx = b.x + 10, by = b.y - 36 + Math.sin(S.t * 3 + b.wig) * 1.5;
+    const bx = b.x + 10 * K, by = b.y - 36 * K + Math.sin(S.t * 3 + b.wig) * 1.5;
     g.fillStyle = 'rgba(255,255,255,0.88)';
-    g.beginPath(); g.arc(b.x + 4, b.y - 20, 2, 0, 7); g.fill();
-    g.beginPath(); g.arc(bx, by, 10, 0, 7); g.fill();
-    drawFoodBit('crumb', bx, by, 4.4);
+    g.beginPath(); g.arc(b.x + 4 * K, b.y - 20 * K, 2 * K, 0, 7); g.fill();
+    g.beginPath(); g.arc(bx, by, 10 * K, 0, 7); g.fill();
+    drawFoodBit('crumb', bx, by, 4.4 * K);
   }
 }
 function drawPupa(b) {
-  g.save(); g.translate(b.x, b.y - 7); g.scale(1.7, 1.7); g.rotate(-0.15 + Math.sin(S.t * 0.8 + b.wig) * 0.03);
-  const shake = b.t > 15 ? Math.sin(S.t * 30) * 0.6 : 0;
-  g.translate(shake, 0);
+  g.save(); g.translate(b.x, b.y - 7 * K); g.scale(1.7 * K, 1.7 * K); g.rotate(-0.15 + Math.sin(S.t * 0.8 + b.wig) * 0.03);
+  g.translate(b.t > 15 ? Math.sin(S.t * 30) * 0.6 : 0, 0);
   g.fillStyle = '#e8d4a6'; g.beginPath(); g.ellipse(0, 0, 7.5, 4, 0, 0, 7); g.fill();
   g.strokeStyle = 'rgba(160,120,70,0.5)'; g.lineWidth = 0.6;
   for (let k = -2; k <= 2; k++) { g.beginPath(); g.ellipse(k * 2.4, 0, 0.6, 3.6, 0, 0, 7); g.stroke(); }
@@ -660,6 +731,13 @@ function drawStar(x, y, s, r) {
   for (let i = 0; i < 10; i++) { const a = i * Math.PI / 5 - Math.PI / 2, rr = i % 2 ? 1.6 : 4; g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
   g.closePath(); g.fill(); g.restore();
 }
+function drawHealth(x, y, hp) {
+  const w = 28 * K, h = 4.5 * K, f = clamp(hp / 100, 0, 1);
+  g.fillStyle = 'rgba(20,12,6,0.75)';
+  g.beginPath(); g.roundRect(x - w / 2 - 1.5, y - 1.5, w + 3, h + 3, 3); g.fill();
+  g.fillStyle = f > 0.6 ? '#5fd35a' : f > 0.3 ? '#ffd23f' : '#ff5a4a';
+  if (f > 0) { g.beginPath(); g.roundRect(x - w / 2, y, w * f, h, 2); g.fill(); }
+}
 function antColor(a) {
   if (a.red) return [ANT_RED, '#8f2a1a'];
   if (a.age < 60) { const t = a.age / 60; return [mix('#c08a55', ANT_BLACK, t), mix('#d6a473', '#4a4650', t)]; }
@@ -667,87 +745,82 @@ function antColor(a) {
 }
 function antDraw(a) {
   a.tilt += (a.tiltT - a.tilt) * 0.25;
-  if (!a.moving && Math.abs(a.tiltT) > 0.01 && !(a.path && a.path.length)) a.tiltT *= 0.9;
+  if (!a.moving && Math.abs(a.tiltT) > 0.01 && !(a.path && a.path.length) && !a.fighting) a.tiltT *= 0.9;
   const [col, far] = antColor(a);
-  const jx = a.fighting || a.fightT != null ? Math.sin(a.jit * 40) * 2.5 : 0;
-  const hopY = a.hop > 0 ? -Math.abs(Math.sin(a.hop * 15)) * 10 : 0;
-  drawAnt(a.x + jx, a.y + hopY, { f: a.f, s: AS * (a.red ? 1.08 : 1), tilt: a.tilt, col, farCol: far, ph: a.ph, moving: a.moving, carry: a.carry, anim: a.anim, red: a.red });
+  const inFight = a.fighting || (a.red && attackersOf(a).some(o => o.fighting));
+  const jx = inFight ? Math.sin(a.jit * 40) * 1.2 * K : 0;
+  const hopY = a.hop > 0 ? -Math.abs(Math.sin(a.hop * 15)) * 10 * K : 0;
+  drawAnt(a.x + jx, a.y + hopY, { f: a.f, s: AS * (a.red ? 1.08 : 1), tilt: a.tilt, col, farCol: far, ph: a.ph, moving: a.moving, carry: a.carry, anim: a.anim, red: a.red, lunge: a.lunge });
+  a.showHp = inFight || a.hp < 99.5;
 }
 
 function render() {
   const p = S.day, night = nightness(p), [top, bot] = skyAt(p);
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  screenT(g);
   const surfScr = offY + SURF * scale;
   const sg = g.createLinearGradient(0, 0, 0, surfScr);
   sg.addColorStop(0, top); sg.addColorStop(1, bot);
   g.fillStyle = sg; g.fillRect(0, 0, cw, surfScr + 2);
-  worldT();
-  // stars
-  if (night > 0.05) {
+  worldT(g);
+  if (night > 0.05) { // stars
     g.fillStyle = '#fff';
     for (const s of stars) { if (s.y > SURF - 20 || s.y < visT - 5) continue; g.globalAlpha = night * (0.5 + 0.5 * Math.sin(S.t * 1.5 + s.p)); g.beginPath(); g.arc(s.x, s.y, s.r, 0, 7); g.fill(); }
     g.globalAlpha = 1;
   }
-  // sun & moon on an arc over the meadow
-  const arc = (t, col, r, glow) => {
-    const x = lerp(visL - 60, visR + 60, t), y = SURF - 30 - Math.sin(t * Math.PI) * (SURF - 30 - Math.max(visT, -400) + 10) * 0.85;
+  const skyH = SURF - visT;
+  const arc = (t, col, r, glow) => { // sun & moon on a low arc over the meadow
+    const x = lerp(visL - 60, visR + 60, t), y = SURF - 25 - Math.sin(t * Math.PI) * Math.max(10, skyH - r - 40);
     const rg = g.createRadialGradient(x, y, r * 0.5, x, y, r * 3);
     rg.addColorStop(0, glow); rg.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = rg;
     g.beginPath(); g.arc(x, y, r * 3, 0, 7); g.fill();
     g.fillStyle = col; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
     return { x, y };
   };
-  if (p < 0.64) arc((p + 0.04) / 0.68, '#ffe14d', 34, 'rgba(255,230,120,0.5)');
-  if (p > 0.6) { const m = arc((p - 0.6) / 0.42, '#f4f1e1', 26, 'rgba(220,230,255,0.35)'); g.fillStyle = 'rgba(180,180,170,0.35)'; g.beginPath(); g.arc(m.x - 8, m.y - 5, 5, 0, 7); g.arc(m.x + 7, m.y + 6, 3.5, 0, 7); g.fill(); }
-  // clouds
-  g.fillStyle = `rgba(255,255,255,${0.9 - night * 0.65})`;
+  if (p < 0.64) arc((p + 0.04) / 0.68, '#ffe14d', 26, 'rgba(255,230,120,0.5)');
+  if (p > 0.6) { const m = arc((p - 0.6) / 0.42, '#f4f1e1', 20, 'rgba(220,230,255,0.35)'); g.fillStyle = 'rgba(180,180,170,0.35)'; g.beginPath(); g.arc(m.x - 6, m.y - 4, 4, 0, 7); g.arc(m.x + 5, m.y + 5, 2.8, 0, 7); g.fill(); }
+  g.fillStyle = `rgba(255,255,255,${0.9 - night * 0.65})`; // clouds
   for (const c of clouds) {
-    g.save(); g.translate(c.x, c.y); g.scale(c.s, c.s); g.beginPath();
+    const cy = Math.max(c.y, visT + 30 * c.s);
+    g.save(); g.translate(c.x, cy); g.scale(c.s, c.s); g.beginPath();
     g.arc(0, 0, 26, 0, 7); g.arc(30, -10, 32, 0, 7); g.arc(62, 0, 24, 0, 7); g.arc(30, 10, 26, 0, 7); g.fill(); g.restore();
   }
-  // ground layer
-  g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(bg, 0, 0);
-  worldT();
-  // chamber contents ---------------------------------------------------
-  // food store pile
-  {
-    const c = CH.F, cx = c.cx - 0.25 * c.rx; let i = 0;
-    for (let r = 0; i < S.store.length; r++) {
-      const n = 13 - 2 * r; if (n <= 0) break;
-      for (let k = 0; k < n && i < S.store.length; k++, i++) {
-        const x = cx + (k - (n - 1) / 2) * 14;
-        drawFoodBit(S.store[i], x, floorY(c, cx) - 8 - r * 11 + Math.abs(x - cx) * 0.06, 7, (i * 1.7) % 3);
+  g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(bg, 0, 0); // ground layer
+  worldT(g);
+  for (const id of STORES) { // food piles
+    const c = CH[id], st = S.stores[id], cx = c.cx - c.s * 0.3 * c.rx, sp = 14 * K; let i = 0;
+    for (let r = 0; i < st.length; r++) {
+      const n = 11 - 2 * r; if (n <= 0) break;
+      for (let k = 0; k < n && i < st.length; k++, i++) {
+        const x = cx + (k - (n - 1) / 2) * sp;
+        drawFoodBit(st[i], x, floorY(c, cx) - 8 * K - r * 11 * K + Math.abs(x - cx) * 0.06, 7 * K, (i * 1.7) % 3);
       }
     }
   }
-  // nursery & queen's eggs
-  for (const b of S.brood) {
+  for (const b of S.brood) { // eggs, larvae, cocoons
     if (b.where === 'carried') continue;
-    if (b.stage === 'egg') drawEgg(b.x, b.y - 3.5, 1.8);
+    if (b.stage === 'egg') drawEgg(b.x, b.y - 3.5 * K, 1.8 * K);
     else if (b.stage === 'larva') drawLarva(b);
     else drawPupa(b);
   }
-  // queen
-  {
-    const q = S.queen, qp = floorPt(CH.Q, q.u, 11 * 1.85);
-    drawAnt(qp.x, qp.y, { f: 1, s: 3.3, col: '#2a1f1a', farCol: '#5a4a40', queen: true, pulse: q.pulse, ph: S.t * 0.6, moving: false, anim: 'groom' });
-    if (q.hunger > 1) { // hungry bubble
-      const bx = qp.x + 52, by = qp.y - 58 + Math.sin(S.t * 2.5) * 2;
-      g.fillStyle = 'rgba(255,255,255,0.88)'; g.beginPath(); g.arc(qp.x + 38, qp.y - 38, 3, 0, 7); g.fill();
-      g.beginPath(); g.arc(bx, by, 12, 0, 7); g.fill(); drawFoodBit('berry', bx, by, 5.5);
+  { // the queen
+    const q = S.queen, qs = 3.3 * K, qp = floorPt(CH.Q, q.u, 6 * qs);
+    drawAnt(qp.x, qp.y, { f: QS, s: qs, col: '#2a1f1a', farCol: '#5a4a40', queen: true, pulse: q.pulse, ph: S.t * 0.6, moving: false, anim: 'groom' });
+    if (q.hunger > 1) {
+      const bx = qp.x + QS * 52 * K, by = qp.y - 58 * K + Math.sin(S.t * 2.5) * 2;
+      g.fillStyle = 'rgba(255,255,255,0.88)'; g.beginPath(); g.arc(qp.x + QS * 38 * K, qp.y - 38 * K, 3 * K, 0, 7); g.fill();
+      g.beginPath(); g.arc(bx, by, 12 * K, 0, 7); g.fill(); drawFoodBit('berry', bx, by, 5.5 * K);
     }
   }
-  // corpses
-  for (const c of S.corpses) {
+  for (const c of S.corpses) { // the dead, and the graveyard
     if (c.state === 'carried') continue;
-    if (c.state === 'lying') drawAnt(c.x, c.y, { f: c.f, s: AS, col: '#2a2a2e', dead: true });
+    const base = c.red ? '#9a3020' : '#2a2a2e';
+    if (c.state === 'lying') drawAnt(c.x, c.y, { f: c.f, s: AS, col: base, dead: true });
     else {
-      const d = c.decay, s = AS * (1 - d * 0.35);
-      drawAnt(c.x, c.y + d * 5, { f: c.f, s, col: mix('#2a2a2e', '#7a5a3c', Math.min(1, d * 1.3)), dead: true, alpha: Math.max(0, 1 - d * d) });
+      const d = c.decay;
+      drawAnt(c.x, c.y + d * 5, { f: c.f, s: AS * (1 - d * 0.35), col: mix(base, '#7a5a3c', Math.min(1, d * 1.3)), dead: true, alpha: Math.max(0, 1 - d * d) });
     }
   }
-  // grass + flowers
-  g.lineCap = 'round'; g.lineWidth = 2.1;
+  g.lineCap = 'round'; g.lineWidth = 2.1; // grass
   for (let c = 0; c < 4; c++) {
     g.strokeStyle = BLADE_COL[c]; g.beginPath();
     for (const b of blades) {
@@ -765,40 +838,44 @@ function render() {
     for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3 + S.t * 0.1; g.beginPath(); g.ellipse(tx + Math.cos(a) * 6, ty + Math.sin(a) * 6, 4.5, 3, a, 0, 7); g.fill(); }
     g.fillStyle = '#f2a516'; g.beginPath(); g.arc(tx, ty, 3.6, 0, 7); g.fill();
   }
-  // surface food
-  for (const f of S.food) {
-    const r = 6 + Math.sqrt(f.bites) * 5, appear = Math.min(1, (S.t - f.born) * 2);
+  for (const f of S.food) { // food lying in the meadow
+    const r = (6 + Math.sqrt(f.bites) * 5) * K, appear = Math.min(1, (S.t - f.born) * 2);
     drawFoodBit(f.type, f.x, SURF - r * 0.7 * appear + 1, r * appear, f.rot);
   }
-  // ants
   for (const a of S.ants) antDraw(a);
   for (const r of S.invaders) antDraw(r);
-  // particles
-  for (const p of S.parts) {
+  for (const a of S.ants) if (a.showHp) drawHealth(a.x, a.y - 22 * K, a.hp);
+  for (const r of S.invaders) if (r.showHp) drawHealth(r.x, r.y - 24 * K, r.hp);
+  for (const p of S.parts) { // particles
     if (p.age < 0) continue;
     const t = p.age / p.life, al = 1 - t * t;
     g.globalAlpha = al;
-    if (p.k === 'heart') { g.fillStyle = '#ff5c8a'; drawHeart(p.x, p.y, p.s * 1.1); }
-    else if (p.k === 'spark') { g.fillStyle = '#fff6b0'; drawStar(p.x, p.y, p.s * 0.6 * (1 - t * 0.5), S.t * 3); }
-    else if (p.k === 'star') { g.fillStyle = '#ffd84a'; drawStar(p.x, p.y, p.s * 0.9, p.r + S.t * 6); }
-    else if (p.k === 'puff') { g.fillStyle = 'rgba(210,180,140,0.7)'; g.beginPath(); g.arc(p.x, p.y, (3 + t * 7) * p.s, 0, 7); g.fill(); }
+    if (p.k === 'heart') { g.fillStyle = '#ff5c8a'; drawHeart(p.x, p.y, p.s * 1.1 * K); }
+    else if (p.k === 'spark') { g.fillStyle = '#fff6b0'; drawStar(p.x, p.y, p.s * 0.6 * K * (1 - t * 0.5), S.t * 3); }
+    else if (p.k === 'star') { g.fillStyle = '#ffd84a'; drawStar(p.x, p.y, p.s * 0.9 * K, p.r + S.t * 6); }
+    else if (p.k === 'puff') { g.fillStyle = 'rgba(210,180,140,0.7)'; g.beginPath(); g.arc(p.x, p.y, (3 + t * 7) * p.s * K, 0, 7); g.fill(); }
+    else if (p.k === 'chomp') { // little white "bite" burst
+      g.strokeStyle = '#fff'; g.lineWidth = 1.6 * K; const r = (4 + t * 8) * K;
+      g.beginPath(); for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5 + 0.3; g.moveTo(p.x + Math.cos(a) * r * 0.5, p.y + Math.sin(a) * r * 0.5); g.lineTo(p.x + Math.cos(a) * r, p.y + Math.sin(a) * r); } g.stroke();
+    }
   }
   g.globalAlpha = 1;
 }
 
 // ---- Initial colony --------------------------------------------------------
 function init() {
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 26; i++) {
     const r = Math.random();
-    const loc = r < 0.3 ? { node: 'N', u: rand(-0.7, 0.7) } : r < 0.5 ? { node: 'F', u: rand(0, 0.7) } : r < 0.7 ? { node: 'Q', u: rand(0.5, 0.85) } : r < 0.9 ? { node: 'E', sx: rand(500, 1200) } : { node: pick(['A', 'B', 'C']) };
+    const loc = r < 0.3 ? { node: pick(NESTS), u: rand(-0.7, 0.7) } : r < 0.5 ? (s => ({ node: s, u: storeDropU(s) }))(pick(STORES))
+      : r < 0.62 ? { node: 'Q', u: QS * rand(0.45, 0.85) } : r < 0.88 ? { node: 'E', sx: rand(500, 1200) } : { node: pick(['A', 'B', 'C']) };
     const life = rand(220, 440);
     const a = new Ant(loc, rand(40, life - 30), { life }); a.idleT = rand(0, 2.5); S.ants.push(a);
   }
-  for (let i = 0; i < 14; i++) S.store.push(pick(Object.keys(FOOD)));
-  const mk = (stage, slot, extra) => { const b = { id: uid++, stage, where: 'nursery', slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), ...extra }; nurseryTaken[slot] = b; S.brood.push(b); };
-  mk('egg', 0, { t: 6 }); mk('larva', 2, { fed: 1, since: 5 }); mk('larva', 4, { fed: 2, since: 2 });
-  mk('larva', 6, { since: 6 }); mk('pupa', 8, { t: 4 }); mk('pupa', 10, { t: 12, fed: 3 });
-  S.brood.push({ id: uid++, stage: 'egg', where: 'queen', slot: 0, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: 0 });
+  for (const s of STORES) for (let i = 0; i < 10; i++) S.stores[s].push(pick(Object.keys(FOOD)));
+  const mk = (nest, stage, slot, extra) => { const b = { id: uid++, stage, where: 'nursery', nest, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), ...extra }; S.nest[nest][slot] = b; S.brood.push(b); };
+  mk('N1', 'egg', 0, { t: 6 }); mk('N1', 'larva', 2, { fed: 1, since: 5 }); mk('N1', 'larva', 4, { fed: 2, since: 2 }); mk('N1', 'pupa', 7, { t: 4 });
+  mk('N2', 'larva', 1, { since: 6 }); mk('N2', 'egg', 3, { t: 10 }); mk('N2', 'pupa', 6, { t: 12, fed: 3 });
+  S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot: 0, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: 0 });
   for (let i = 0; i < 3; i++) { S.nextFood = 0; updateFood(0); }
   S.nextFood = 3;
 }
@@ -811,9 +888,15 @@ function frame(now) {
   render();
   requestAnimationFrame(frame);
 }
+// On phones/tablets, a tap goes full screen and locks landscape where the browser allows it.
+addEventListener('pointerup', () => {
+  if (!COARSE || document.fullscreenElement || !document.documentElement.requestFullscreen) return;
+  document.documentElement.requestFullscreen({ navigationUI: 'hide' })
+    .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
+});
 addEventListener('resize', resize);
 resize(); init();
-window.__sim = { S, update, render, N, CH };
+window.__sim = { S, update, render, N, CH, spawnRaid };
 requestAnimationFrame(frame);
 </script>
 </body>
