@@ -530,11 +530,31 @@ function updateRaids(dt) {
     let defs = attackersOf(r).length;
     while (defs < 4) {
       let best = null, bd = 1e9;
-      for (const a of S.ants) if (a.interruptible && a.age > 20 && a.hp >= 70) { const d = dist(a, r); if (d < bd) { bd = d; best = a; } }
+      for (const a of S.ants) if (canDefend(a)) { const d = dist(a, r); if (d < bd) { bd = d; best = a; } }
       if (!best) break;
-      best.abort(); best.mode = 'defend'; best.target = r; best.goalKey = null; best.fighting = false; defs++;
+      enlist(best, r); defs++;
     }
   }
+}
+// Who answers the alarm: any grown, healthy ant that's free, plus ants already out on
+// the surface. A surface forager drops its food (it stays in the grass for later) and
+// turns straight round to fight.
+const onSurface = a => a.loc.node === 'E' && Math.abs(a.y - (SURF - LIFT)) < 1;
+function canDefend(a) {
+  if (a.mode || a.age <= 20 || a.hp < 70) return false;
+  if (a.interruptible) return true;
+  return onSurface(a) && (!a.carry || a.carry.kind === 'food');
+}
+function enlist(a, r) {
+  if (a.carry && a.carry.kind === 'food') {
+    S.food.push({ x: a.x + a.f * 14 * K, type: a.carry.type, bites: 1, max: 1, claims: 0, born: S.t, rot: rand(-0.6, 0.6) });
+    a.carry = null;
+  }
+  a.abort();
+  if (onSurface(a)) a.loc = { node: 'E', sx: a.x };
+  a.mode = 'defend'; a.target = r; a.goalKey = null; a.fighting = false; a.path = [];
+  a.face(r); a.hop = 0.3;
+  S.parts.push({ k: 'alert', x: a.x, y: a.y - 26 * K, vx: 0, vy: -10, life: 1.1, age: 0, s: 1 });
 }
 function retreat(a) {
   a.mode = null; a.target = null; a.fighting = false; a.path = []; a.moving = false;
@@ -568,7 +588,9 @@ function updateDefender(a, dt) {
     return;
   }
   if (d < 80 * K) { a.moveDirect(r.x, r.y, dt, 1.3); a.loc = r.path.length ? r.path[0].loc : r.loc; return; }
-  const goal = r.path.length ? r.path[0].loc : r.loc, key = JSON.stringify(goal);
+  // On the surface, chase the raider itself; underground, head for its next waypoint.
+  const goal = onSurface(r) ? { node: 'E', sx: r.x } : r.path.length ? r.path[0].loc : r.loc;
+  const key = onSurface(r) ? 'surf' + Math.round(r.x / 25) : JSON.stringify(goal);
   if (key !== a.goalKey || !a.path.length) { a.goalKey = key; a.path = buildPath(a.path.length ? a.path[0].loc : a.loc, goal); }
   a.move(dt, 1.3);
 }
@@ -854,6 +876,10 @@ function render() {
     else if (p.k === 'spark') { g.fillStyle = '#fff6b0'; drawStar(p.x, p.y, p.s * 0.6 * K * (1 - t * 0.5), S.t * 3); }
     else if (p.k === 'star') { g.fillStyle = '#ffd84a'; drawStar(p.x, p.y, p.s * 0.9 * K, p.r + S.t * 6); }
     else if (p.k === 'puff') { g.fillStyle = 'rgba(210,180,140,0.7)'; g.beginPath(); g.arc(p.x, p.y, (3 + t * 7) * p.s * K, 0, 7); g.fill(); }
+    else if (p.k === 'alert') { // "!" over an ant that has spotted a raider
+      g.font = `bold ${18 * K}px system-ui, sans-serif`; g.textAlign = 'center';
+      g.lineWidth = 3 * K; g.strokeStyle = '#3a1a0a'; g.strokeText('!', p.x, p.y); g.fillStyle = '#ffe14d'; g.fillText('!', p.x, p.y);
+    }
     else if (p.k === 'chomp') { // little white "bite" burst
       g.strokeStyle = '#fff'; g.lineWidth = 1.6 * K; const r = (4 + t * 8) * K;
       g.beginPath(); for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5 + 0.3; g.moveTo(p.x + Math.cos(a) * r * 0.5, p.y + Math.sin(a) * r * 0.5); g.lineTo(p.x + Math.cos(a) * r, p.y + Math.sin(a) * r); } g.stroke();
