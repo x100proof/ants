@@ -10,10 +10,32 @@
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#4a2e1a}
   canvas{display:block;width:100vw;height:100vh;touch-action:none}
+  #ui{position:fixed;top:12px;right:12px;display:flex;gap:10px;z-index:2;transform-origin:100% 0}
+  #ui.rot{top:auto;bottom:12px;flex-direction:column}
+  #ui.rot svg{transform:rotate(90deg)}
+  #ui button{width:44px;height:44px;border-radius:50%;border:0;padding:0;cursor:pointer;
+    background:rgba(20,14,10,.42);color:#fff;display:grid;place-items:center;
+    backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);transition:background .2s,transform .1s}
+  #ui button:hover{background:rgba(20,14,10,.62)}
+  #ui button:active{transform:scale(.92)}
+  #ui button:focus-visible{outline:3px solid #ffd23f;outline-offset:2px}
+  #ui svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+  #ui [hidden],#hint[hidden]{display:none}
+  #hint{position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:2;border:0;cursor:pointer;
+    font:600 18px/1 system-ui,-apple-system,"Segoe UI",sans-serif;color:#3a2412;background:#fff6d6;
+    padding:12px 20px;border-radius:999px;box-shadow:0 4px 18px rgba(0,0,0,.3);animation:hint 2s ease-in-out infinite}
+  #hint.rot{left:auto;right:0;top:50%;transform:translate(calc(50% - 36px),-50%) rotate(90deg);animation:none}
+  @keyframes hint{0%,100%{transform:translateX(-50%) scale(1)}50%{transform:translateX(-50%) scale(1.07)}}
+  @media (prefers-reduced-motion:reduce){#hint{animation:none}}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<button id="hint" type="button" hidden>♪ Click for music</button>
+<div id="ui">
+  <button id="snd" type="button" aria-label="Sound on" title="Sound"></button>
+  <button id="fs" type="button" aria-label="Full screen" title="Full screen" hidden></button>
+</div>
 <script>
 'use strict';
 // ---------------------------------------------------------------------------
@@ -28,6 +50,81 @@ const PHONE = params.has('phone') || (COARSE && Math.min(screen.width, screen.he
 const AS = PHONE ? 2.35 : 1.75;      // ant drawing scale
 const K = AS / 1.75;                 // creature/food scale relative to desktop
 const LIFT = 6 * AS;                 // ant body centre above the floor
+// ---- Remote debug log --------------------------------------------------------
+// Batches errors, warnings, notable events, anomaly checks and periodic state
+// snapshots, and POSTs them as JSON to LOG_ENDPOINT (relative to the page) on the
+// server hosting the game. If nothing is listening there, the requests just fail
+// quietly. Turn it off with ?nolog. In the browser console,
+// antsDebug.report('what happened') sends everything right away.
+const LOG_ENDPOINT = 'api/log';
+const DBG = (() => {
+  const on = !params.has('nolog') && location.protocol.startsWith('http');
+  const SID = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);
+  const BUILD = '__BUILD__';
+  const MAX_ENTRIES = 300, MAX_SNAPS = 30, MAX_POSTS = 400, MAX_BODY = 48000;
+  const entries = [], snaps = [];
+  let unsent = 0, posts = 0, timer = 0, lastFlush = 0;
+  const now = () => Math.round(performance.now());
+  function safe(v, d = 0) {
+    if (v === null || v === undefined) return v;
+    if (typeof v === 'number') return Number.isFinite(v) ? +v.toPrecision(6) : String(v);
+    if (typeof v === 'string') return v.length > 600 ? v.slice(0, 600) + '…' : v;
+    if (typeof v === 'boolean') return v;
+    if (v instanceof Error) return { name: v.name, message: v.message, stack: (v.stack || '').slice(0, 1500) };
+    if (d > 4) return '…';
+    if (Array.isArray(v)) return v.slice(0, 25).map(x => safe(x, d + 1));
+    if (typeof v === 'object') { const o = {}; for (const k of Object.keys(v).slice(0, 40)) o[k] = safe(v[k], d + 1); return o; }
+    return String(v);
+  }
+  function record(kind, msg, data) { // kind: log | info | warn | error | event | anomaly | stall
+    if (!on) return;
+    const m = safe(String(msg)), last = entries[entries.length - 1];
+    if (last && last.kind === kind && last.msg === m) { last.count = (last.count || 1) + 1; last.lastAt = now(); return; }
+    entries.push({ at: now(), simT: typeof S === 'object' ? +S.t.toFixed(1) : null, kind, msg: m, data: data === undefined ? undefined : safe(data) });
+    if (entries.length > MAX_ENTRIES) entries.shift();
+    unsent++;
+    if (kind === 'error' || kind === 'anomaly' || kind === 'stall') schedule(2000);
+  }
+  function snapshot(state) { if (!on) return; snaps.push({ at: now(), ...safe(state) }); if (snaps.length > MAX_SNAPS) snaps.shift(); }
+  function payload(reason) {
+    const body = { sid: SID, build: BUILD, reason, ua: navigator.userAgent, url: location.pathname + location.search,
+      screen: `${innerWidth}x${innerHeight}@${devicePixelRatio}`, uptimeMs: now(),
+      entries: entries.slice(-Math.max(1, unsent)), snaps: snaps.slice(-6) };
+    let json = JSON.stringify(body);
+    while (json.length > MAX_BODY && body.entries.length > 5) { body.entries = body.entries.slice(Math.floor(body.entries.length / 2)); json = JSON.stringify(body); }
+    return json;
+  }
+  function flush(reason = 'batch', beacon = false) {
+    clearTimeout(timer); timer = 0;
+    if (!on || posts >= MAX_POSTS || (!unsent && reason === 'batch')) return;
+    posts++; lastFlush = performance.now();
+    const json = payload(reason); unsent = 0;
+    try {
+      if (beacon && navigator.sendBeacon) navigator.sendBeacon(LOG_ENDPOINT, new Blob([json], { type: 'application/json' }));
+      else fetch(LOG_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: json, keepalive: true }).catch(() => {});
+    } catch (e) { /* logging must never break the game */ }
+  }
+  function schedule(ms) {
+    if (timer) return;
+    timer = setTimeout(() => flush('auto'), Math.max(ms, 5000 - (performance.now() - lastFlush)));
+  }
+  function init() {
+    if (!on) return;
+    for (const level of ['log', 'info', 'warn', 'error']) {
+      const orig = console[level].bind(console);
+      console[level] = (...args) => { orig(...args); try { record(level, args.map(a => typeof a === 'string' ? a : JSON.stringify(safe(a))).join(' ')); } catch (e) { /* ignore */ } };
+    }
+    addEventListener('error', e => record('error', e.message || 'error', { src: e.filename, line: e.lineno, col: e.colno, stack: e.error && e.error.stack }));
+    addEventListener('unhandledrejection', e => record('error', 'unhandled rejection', { reason: safe(e.reason) }));
+    addEventListener('pagehide', () => flush('pagehide', true));
+    document.addEventListener('visibilitychange', () => { record('event', document.hidden ? 'hidden' : 'visible'); if (document.hidden) flush('hidden', true); });
+    setInterval(() => { if (unsent) flush('batch'); }, 60000);
+    window.antsDebug = { sid: SID, entries, snaps,
+      report(note = '') { record('event', 'manual report', { note, state: debugState() }); flush('manual'); return `sent (session ${SID})`; } };
+    console.info(`[ants] debug session ${SID}; logs go to ${LOG_ENDPOINT}; antsDebug.report('note') sends now`);
+  }
+  return { on, SID, record, snapshot, flush, init, event: (m, d) => record('event', m, d), anomaly: (m, d) => record('anomaly', m, d) };
+})();
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -109,6 +206,8 @@ function resize() {
   dpr = Math.min(2, window.devicePixelRatio || 1);
   const w0 = innerWidth, h0 = innerHeight;
   ROT = COARSE && h0 > w0;
+  document.getElementById('ui').classList.toggle('rot', ROT);
+  document.getElementById('hint').classList.toggle('rot', ROT);
   cw = ROT ? h0 : w0; chh = ROT ? w0 : h0;
   cv.width = Math.round(w0 * dpr); cv.height = Math.round(h0 * dpr);
   scale = Math.min(chh / (H - VIEW_TOP), cw / VIEW_W);
@@ -217,25 +316,38 @@ const DAY_LEN = 300;
 // ---- Weather -----------------------------------------------------------------
 // Sunny -> cloudy -> rain -> thunderstorm and back. Each state has target levels for
 // cloud cover, rain and storminess; the live levels drift towards them slowly, so
-// each change takes roughly 10-20 seconds. In a thunderstorm the ants stay in,
+// each change takes roughly 5-12 seconds. In a thunderstorm the ants stay in,
 // nobody forages, and red ants don't raid.
 const WEATHER = {
-  sunny: { cover: 0.28, rain: 0, storm: 0, dur: [100, 200], next: ['cloudy'] },
-  cloudy: { cover: 0.75, rain: 0, storm: 0, dur: [60, 120], next: ['sunny', 'sunny', 'rain'] },
-  rain: { cover: 0.92, rain: 0.6, storm: 0, dur: [60, 120], next: ['cloudy', 'storm', 'storm'] },
-  storm: { cover: 1, rain: 1, storm: 1, dur: [50, 90], next: ['rain'] },
+  sunny: { cover: 0.28, rain: 0, storm: 0 },
+  cloudy: { cover: 0.75, rain: 0, storm: 0 },
+  rain: { cover: 0.92, rain: 0.6, storm: 0 },
+  storm: { cover: 1, rain: 1, storm: 1 },
 };
-const Wx = { state: WEATHER[params.get('weather')] ? params.get('weather') : 'sunny', left: 0, cover: 0, rain: 0, storm: 0, wind: 0, drops: [], splashes: [], bolts: [], flash: 0, boltT: 3 };
-Object.assign(Wx, (({ cover, rain, storm }) => ({ cover, rain, storm }))(WEATHER[Wx.state]), { left: rand(...WEATHER[Wx.state].dur) });
+// The weather goes round this loop (about 3 minutes in all), so a few minutes of
+// watching shows every kind. Each entry is [weather, min seconds, max seconds].
+const CYCLE = [['sunny', 40, 60], ['cloudy', 20, 30], ['rain', 25, 35], ['storm', 35, 50], ['rain', 15, 25], ['cloudy', 15, 25]];
+const startIdx = Math.max(0, CYCLE.findIndex(c => c[0] === params.get('weather')));
+const Wx = { idx: startIdx, state: CYCLE[startIdx][0], left: rand(CYCLE[startIdx][1], CYCLE[startIdx][2]), cover: 0, rain: 0, storm: 0, wind: 0, drops: [], splashes: [], bolts: [], flash: 0, boltT: 3 };
+Object.assign(Wx, (({ cover, rain, storm }) => ({ cover, rain, storm }))(WEATHER[Wx.state]));
 const stormy = () => Wx.state === 'storm';
-function setWeather(st) { Wx.state = st; Wx.left = rand(...WEATHER[st].dur); }
+function setWeather(st) { // jump to a weather (also used by tests)
+  const i = CYCLE.findIndex(c => c[0] === st);
+  DBG.event('weather', { from: Wx.state, to: st });
+  Wx.idx = i; Wx.state = st; Wx.left = rand(CYCLE[i][1], CYCLE[i][2]);
+}
+function nextWeather() {
+  const i = (Wx.idx + 1) % CYCLE.length, [st, lo, hi] = CYCLE[i];
+  DBG.event('weather', { from: Wx.state, to: st });
+  Wx.idx = i; Wx.state = st; Wx.left = rand(lo, hi);
+}
 function updateWeather(dt) {
   Wx.left -= dt;
-  if (Wx.left <= 0) setWeather(pick(WEATHER[Wx.state].next));
+  if (Wx.left <= 0) nextWeather();
   const w = WEATHER[Wx.state], toward = (v, t, rate) => v + clamp(t - v, -rate * dt, rate * dt);
-  Wx.cover = toward(Wx.cover, w.cover, 1 / 23);
-  Wx.rain = toward(Wx.rain, w.rain, 1 / 20);
-  Wx.storm = toward(Wx.storm, w.storm, 1 / 20);
+  Wx.cover = toward(Wx.cover, w.cover, 1 / 14);
+  Wx.rain = toward(Wx.rain, w.rain, 1 / 12);
+  Wx.storm = toward(Wx.storm, w.storm, 1 / 12);
   Wx.wind = 30 + Wx.storm * 170;
   // raindrops fall through the sky and splash on the grass
   let n = Math.pow(Wx.rain, 1.5) * 900 * dt;
@@ -250,7 +362,7 @@ function updateWeather(dt) {
   for (let i = Wx.bolts.length - 1; i >= 0; i--) if ((Wx.bolts[i].age += dt) > 0.45) Wx.bolts.splice(i, 1);
   if (Wx.storm > 0.6) {
     Wx.boltT -= dt;
-    if (Wx.boltT <= 0) { Wx.boltT = rand(2.5, 8); Wx.bolts.push(makeBolt()); Wx.flash = 1; }
+    if (Wx.boltT <= 0) { Wx.boltT = rand(2.5, 8); const bolt = makeBolt(); Wx.bolts.push(bolt); Wx.flash = 1; SND.thunder(bolt.main[0][0]); }
   }
 }
 function makeBolt() {
@@ -283,9 +395,9 @@ const S = {
   ants: [], invaders: [], corpses: [], brood: [], parts: [], food: [],
   stores: { F1: [], F2: [] },
   nest: { N1: new Array(NEST_SLOTS).fill(null), N2: new Array(NEST_SLOTS).fill(null) },
-  queen: { u: -QS * 0.04, layT: 4, hunger: 0.5, claimed: false, pulse: 0 },
+  queen: { u: -QS * 0.04, layT: 4, hunger: 0.5, claimed: false, pulse: 0, want: 'berry', happy: 0 },
   nextFood: 2, nextRaid: 25,
-  stats: { born: 0, died: 0, buried: 0, decomposed: 0, raids: 0, redKilled: 0, redBuried: 0, retreats: 0, bites: 0, foodIn: 0, fed: 0, eggs: 0 },
+  stats: { born: 0, died: 0, buried: 0, decomposed: 0, raids: 0, redKilled: 0, redBuried: 0, refused: 0, retreats: 0, bites: 0, foodIn: 0, fed: 0, eggs: 0 },
 };
 let uid = 0;
 const storeTotal = () => S.stores.F1.length + S.stores.F2.length;
@@ -298,7 +410,7 @@ class Ant {
     this.job = null; this.carry = null; this.speed = (opts.speed || rand(70, 88)) * Math.sqrt(K);
     this.mode = null; this.target = null; this.hop = 0; this.anim = null; this.moving = false;
     this.red = !!opts.red; this.jit = 0; this.dir = { x: 1, y: 0 };
-    this.hp = 100; this.biteT = rand(0.3, 1); this.lunge = 0; this.fighting = false;
+    this.hp = 100; this.biteT = rand(0.3, 1); this.lunge = 0; this.fighting = false; this.odo = 0;
   }
   move(dt, mult = 1) {
     let rem = this.speed * mult * dt * (this.carry ? 0.88 : 1);
@@ -306,15 +418,15 @@ class Ant {
     while (rem > 0 && this.path.length) {
       const t = this.path[0], dx = t.x - this.x, dy = t.y - this.y, d = Math.hypot(dx, dy);
       if (d > 0.01) { if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx)); this.dir = { x: dx / d, y: dy / d }; }
-      if (d <= rem) { this.x = t.x; this.y = t.y; this.loc = t.loc; this.path.shift(); rem -= d; }
-      else { this.x += dx / d * rem; this.y += dy / d * rem; rem = 0; }
+      if (d <= rem) { this.x = t.x; this.y = t.y; this.loc = t.loc; this.path.shift(); rem -= d; this.odo += d; }
+      else { this.x += dx / d * rem; this.y += dy / d * rem; this.odo += rem; rem = 0; }
     }
     if (this.moving) this.ph += dt * this.speed * mult * 0.42 / Math.sqrt(K);
   }
   moveDirect(tx, ty, dt, mult) {
     const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), s = Math.min(d, this.speed * mult * dt);
     if (d > 0.5) {
-      this.x += dx / d * s; this.y += dy / d * s;
+      this.x += dx / d * s; this.y += dy / d * s; this.odo += s;
       if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx));
       this.ph += dt * this.speed * mult * 0.42 / Math.sqrt(K); this.moving = true;
       return false;
@@ -355,9 +467,27 @@ const wait = (d, anim) => ({ t: 'wait', d, anim });
 const doo = f => ({ t: 'do', f });
 const storeTakeU = id => CH[id].s * rand(0.25, 0.38);
 const storeDropU = id => CH[id].s * rand(0.35, 0.65);
-function takeStoreFor(near) { // nearest store that has food
+// Every larva and the queen fancies one particular food (`want`), shown in their
+// thought bubble, and changes their mind after each meal. Only that food makes them happy, so nurses fetch exactly that, foragers
+// look out for foods that are wanted but running out, and the meadow sprouts more
+// of whatever the colony is short of, so nobody waits forever.
+const FOOD_TYPES = Object.keys(FOOD);
+const has = (id, type) => type == null ? S.stores[id].length > 0 : S.stores[id].includes(type);
+const stocked = type => STORES.some(id => has(id, type));
+function takeStoreFor(near, type) { // nearest store that has (that) food
   const order = near === 'N1' ? ['F2', 'F1'] : near === 'N2' ? ['F1', 'F2'] : STORES.slice().sort((a, b) => S.stores[b].length - S.stores[a].length);
-  return order.find(id => S.stores[id].length) || null;
+  return order.find(id => has(id, type)) || null;
+}
+function nextWant(prev) { // a different food, usually one the stores have
+  const opts = FOOD_TYPES.filter(t => t !== prev), inStock = opts.filter(stocked);
+  return pick(inStock.length && Math.random() < 0.75 ? inStock : opts);
+}
+function takeFrom(id, type) { const st = S.stores[id], i = type == null ? st.length - 1 : st.lastIndexOf(type); return i < 0 ? null : st.splice(i, 1)[0]; }
+function wantedShort() { // foods a hungry creature wants that no store has
+  const w = new Set();
+  for (const b of S.brood) if (b.stage === 'larva' && b.fed < 3 && !stocked(b.want)) w.add(b.want);
+  if (S.queen.hunger > 0.6 && !stocked(S.queen.want)) w.add(S.queen.want);
+  return w;
 }
 const nestOf = loc => (loc && NESTS.includes(loc.node)) ? loc.node : pick(NESTS);
 
@@ -379,6 +509,7 @@ function shelterJob(a) { // storm: hurry inside and wait it out
 // already carrying food keep going to the store; a body being carried to the graveyard
 // is put down until the storm passes.
 function stormShelter() {
+  let n = 0;
   for (const a of S.ants) {
     if (a.mode) continue;
     const headingOut = a.path.length > 0 && a.path[a.path.length - 1].loc.sx != null;
@@ -390,8 +521,9 @@ function stormShelter() {
     }
     a.abort();
     if (onSurface(a)) a.loc = { node: 'E', sx: a.x };
-    a.job = shelterJob(a);
+    a.job = shelterJob(a); n++;
   }
+  if (n) DBG.event('sheltering from storm', { n });
 }
 function restJob(a) { // a hurt ant goes home to rest and heal
   const n = pick(NESTS);
@@ -412,25 +544,37 @@ function forageJob(a, item) {
     ], abort: rel,
   };
 }
-function fetchFood(a, near) { // steps: walk to a store and pick up one food item
-  let store = null;
+function fetchFood(a, near, want, oops = false) { // steps: walk to a store and pick up the wanted food
+  let store = null, pickType = want;                // oops: grab the wrong food by mistake
   return [
-    doo(() => { store = takeStoreFor(near); if (!store) return false; }),
+    doo(() => {
+      store = takeStoreFor(near, want); if (!store) return false;
+      if (oops) { const other = S.stores[store].filter(t => t !== want); pickType = other.length ? pick(other) : want; }
+    }),
     go(() => ({ node: store, u: storeTakeU(store) })),
-    doo(() => { if (!S.stores[store].length) return false; a.carry = { kind: 'food', type: S.stores[store].pop() }; }),
+    doo(() => { let t = takeFrom(store, pickType); if (t == null && pickType !== want) t = takeFrom(store, want); if (t == null) return false; a.carry = { kind: 'food', type: t }; }),
   ];
 }
-function returnFood(a) { if (a.carry && a.carry.kind === 'food') { const s = takeStoreFor() || 'F1'; S.stores[s].push(a.carry.type); a.carry = null; } }
+function returnFood(a, into) { if (a.carry && a.carry.kind === 'food') { const s = STORES.includes(into) ? into : takeStoreFor() || 'F1'; S.stores[s].push(a.carry.type); a.carry = null; } }
 function feedLarvaJob(a, larva) {
   larva.claimed = true; const rel = () => { larva.claimed = false; };
-  const n = larva.nest, s = CH[n].s;
+  const n = larva.nest, s = CH[n].s, oops = Math.random() < 0.15; // now and then a nurse brings the wrong thing
+  let wrong = false;
   return {
     steps: [
-      ...fetchFood(a, n),
+      ...fetchFood(a, n, larva.want, oops),
       go(() => ({ node: n, u: slotU(n, larva.slot) - s * 0.09 })),
       doo(() => { a.f = s; }),
-      wait(1.6, 'feed'),
-      doo(() => { larva.fed++; larva.since = 0; a.carry = null; rel(); S.stats.fed++; hearts(larva.x, larva.y - 14 * K, 3); }),
+      wait(1.2, 'feed'),
+      doo(() => {
+        if (a.carry.type !== larva.want) { // "not that one!": it turns away and the nurse takes it back
+          wrong = true; larva.refuse = 1.2; rel(); S.stats.refused++; nope(larva.x, larva.y - 22 * K); return;
+        }
+        larva.fed++; larva.since = 0; larva.happy = 2.5; a.carry = null; rel(); S.stats.fed++; hearts(larva.x, larva.y - 14 * K, 3);
+        larva.want = nextWant(larva.want); // next time it'll fancy something else
+      }),
+      go(() => { if (!wrong) return a.loc; const st = takeStoreFor() || pick(STORES); return { node: st, u: storeDropU(st) }; }),
+      doo(() => { if (wrong) returnFood(a, a.loc.node); }),
     ], abort: () => { rel(); returnFood(a); },
   };
 }
@@ -438,11 +582,12 @@ function feedQueenJob(a) {
   const q = S.queen; q.claimed = true; const rel = () => { q.claimed = false; };
   return {
     steps: [
-      ...fetchFood(a, 'Q'),
+      ...fetchFood(a, 'Q', q.want),
       go(() => ({ node: 'Q', u: q.u + QS * 0.42 * K })),
       doo(() => { a.f = -QS; }),
       wait(2, 'feed'),
-      doo(() => { q.hunger = 0; a.carry = null; rel(); const p = floorPt(CH.Q, q.u + QS * 0.25 * K, 50 * K); hearts(p.x, p.y, 5); }),
+      doo(() => { q.hunger = 0; q.happy = 3; a.carry = null; rel(); const p = floorPt(CH.Q, q.u + QS * 0.25 * K, 50 * K); hearts(p.x, p.y, 6);
+        q.want = nextWant(q.want); }), // next time she'll fancy something else
     ], abort: () => { rel(); returnFood(a); },
   };
 }
@@ -485,11 +630,15 @@ function chooseJob(a) {
   if (corpse && grown && !stormy() && Math.random() < 0.75) return buryJob(a, corpse);
   const egg = S.brood.find(b => b.where === 'queen' && !b.claimed);
   if (egg && Math.random() < 0.75 && freeSlot()) return eggJob(a, egg);
-  if (storeTotal() && q.hunger > 1 && !q.claimed && Math.random() < 0.8) return feedQueenJob(a);
-  const hungry = S.brood.filter(b => b.stage === 'larva' && b.where === 'nursery' && b.hungry && !b.claimed);
-  if (hungry.length && storeTotal() && Math.random() < 0.8) {
+  if (q.hunger > 1 && !q.claimed && stocked(q.want) && Math.random() < 0.8) return feedQueenJob(a);
+  const hungry = S.brood.filter(b => b.stage === 'larva' && b.where === 'nursery' && b.hungry && !b.claimed && stocked(b.want));
+  if (hungry.length && Math.random() < 0.8) {
     const near = hungry.filter(b => b.nest === nestOf(a.loc));
     return feedLarvaJob(a, pick(near.length ? near : hungry));
+  }
+  if (grown && !stormy()) { // fetching a food someone wants that the stores are out of comes first, even if they're full
+    const short = wantedShort(), urgent = S.food.filter(f => f.bites - f.claims > 0 && short.has(f.type));
+    if (urgent.length && Math.random() < 0.9) { urgent.sort((p, r) => Math.abs(p.x - a.x) - Math.abs(r.x - a.x)); return forageJob(a, urgent[0]); }
   }
   if (grown && !stormy() && storeTotal() < STORE_CAP * 2 - 6) {
     const foragers = S.ants.filter(x => x.carry && x.carry.kind === 'food').length;
@@ -507,19 +656,20 @@ function hearts(x, y, n) { for (let i = 0; i < n; i++) S.parts.push({ k: 'heart'
 function sparkle(x, y, n) { for (let i = 0; i < n; i++) S.parts.push({ k: 'spark', x: x + rand(-8, 8), y: y + rand(-8, 4), vx: rand(-10, 10), vy: rand(-20, -5), life: 0.9, age: 0, s: rand(0.7, 1.3) }); }
 function starBurst(x, y, n) { for (let i = 0; i < n; i++) { const a = rand(-Math.PI, 0); S.parts.push({ k: 'star', x, y, vx: Math.cos(a) * rand(20, 45), vy: Math.sin(a) * rand(20, 45), life: 0.9, age: 0, s: rand(0.7, 1.2), r: rand(0, 6) }); } }
 function puff(x, y) { S.parts.push({ k: 'puff', x: x + rand(-8, 8), y: y + rand(-6, 4), vx: rand(-6, 6), vy: rand(-10, -2), life: 0.7, age: 0, s: rand(0.6, 1.2) }); }
+function nope(x, y) { S.parts.push({ k: 'nope', x, y, vx: 0, vy: -8, life: 1.1, age: 0, s: 1 }); }
 function chomp(x, y) { S.parts.push({ k: 'chomp', x, y, vx: 0, vy: -12, life: 0.45, age: 0, s: 1 }); }
 
 // ---- Lifecycle -----------------------------------------------------------
 function updateQueen(dt) {
   const q = S.queen;
-  q.hunger += dt / 28; q.pulse = Math.max(0, q.pulse - dt);
+  q.hunger += dt / 28; q.pulse = Math.max(0, q.pulse - dt); q.happy = Math.max(0, q.happy - dt);
   q.layT -= dt;
   if (q.layT <= 0) {
     const used = new Set(S.brood.filter(b => b.where === 'queen').map(b => b.slot));
     let slot = -1; for (let i = 0; i < 5; i++) if (!used.has(i)) { slot = i; break; }
     const pop = S.ants.length + S.brood.length;
     if (slot >= 0 && S.brood.length < BROOD_CAP && pop < POP_CAP) {
-      S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6) });
+      S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), want: pick(FOOD_TYPES), happy: 0, refuse: 0 });
       q.pulse = 0.8; S.stats.eggs++;
       const p = floorPt(CH.Q, qEggU(slot), 4); sparkle(p.x, p.y - 4, 4);
     }
@@ -532,7 +682,7 @@ function updateBrood(dt) {
     if (b.where === 'queen') { const p = floorPt(CH.Q, qEggU(b.slot), 3); b.x = p.x; b.y = p.y - (b.slot % 2) * 5 * K; continue; }
     if (b.where !== 'nursery') continue;
     const p = floorPt(CH[b.nest], slotU(b.nest, b.slot), 4); b.x = p.x; b.y = p.y;
-    b.t += dt; b.since += dt;
+    b.t += dt; b.since += dt; b.happy = Math.max(0, (b.happy || 0) - dt); b.refuse = Math.max(0, (b.refuse || 0) - dt);
     if (b.stage === 'egg' && b.t > 16) { b.stage = 'larva'; b.t = 0; b.since = 4; sparkle(b.x, b.y, 2); }
     else if (b.stage === 'larva') {
       b.hungry = b.fed < 3 && b.since > 5;
@@ -550,11 +700,12 @@ function updateFood(dt) {
   const night = nightness(S.day);
   if (S.nextFood <= 0) {
     S.nextFood = rand(4, 7) * (night > 0.5 ? 2.5 : 1);
-    if (S.food.length < 6 && !stormy()) {
+    if ((S.food.length < 6 || (S.food.length < 8 && wantedShort().size)) && !stormy()) {
       const lo = Math.max(60, visL + 50), hi = Math.min(1320, visR - 50);
       let x, tries = 0;
       do { x = rand(lo, hi); tries++; } while ((Math.abs(x - 800) < 90 || S.food.some(f => Math.abs(f.x - x) < 60)) && tries < 20);
-      const type = pick(Object.keys(FOOD)), bites = 2 + Math.floor(Math.random() * 5);
+      const short = [...wantedShort()].filter(t => !S.food.some(f => f.type === t));
+      const type = short.length && Math.random() < 0.7 ? pick(short) : pick(FOOD_TYPES), bites = 2 + Math.floor(Math.random() * 5);
       S.food.push({ x, type, bites, max: bites, claims: 0, born: S.t, rot: rand(-0.6, 0.6) });
     }
   }
@@ -571,10 +722,11 @@ function spawnRaid() {
   const n = Math.random() < 0.55 ? 1 : Math.random() < 0.75 ? 2 : 3;
   const side = Math.random() < 0.5 ? -1 : 1;
   S.stats.raids++;
+  DBG.event('raid', { n, side });
   for (let i = 0; i < n; i++) {
     const sx = side < 0 ? visL - 30 * K - i * 50 * K : visR + 30 * K + i * 50 * K;
     const r = new Ant({ node: 'E', sx }, 100, { red: true, speed: rand(58, 66) });
-    r.side = side; r.f = -side; r.dir = { x: -side, y: 0 };
+    r.side = side; r.spawnT = S.t; r.f = -side; r.dir = { x: -side, y: 0 };
     const st = pick(STORES);
     r.path = buildPath(r.loc, { node: st, u: storeDropU(st) });
     S.invaders.push(r);
@@ -582,13 +734,14 @@ function spawnRaid() {
 }
 function killRed(r) {
   S.invaders.splice(S.invaders.indexOf(r), 1); r.gone = true; S.stats.redKilled++;
+  DBG.event('red ant beaten', { id: r.id, secs: +(S.t - r.spawnT).toFixed(1) });
   starBurst(r.x, r.y - 20 * K, 8);
   S.corpses.push({ id: r.id, red: true, x: r.x, y: r.y + 5 * K, f: r.f, loc: r.path.length ? r.path[0].loc : r.loc, state: 'lying', claimed: false, decay: 0 });
 }
 function updateRaids(dt) {
   S.nextRaid -= dt;
   if (S.nextRaid <= 0) {
-    if (stormy() || WEATHER[Wx.state].storm) S.nextRaid = rand(15, 30); // nobody raids in a storm
+    if (stormy()) S.nextRaid = rand(15, 30); // nobody raids in a storm
     else { S.nextRaid = rand(50, 100); spawnRaid(); }
   }
   for (const r of S.invaders.slice()) {
@@ -650,6 +803,7 @@ function enlist(a, r) {
 function retreat(a) {
   a.mode = null; a.target = null; a.fighting = false; a.path = []; a.moving = false;
   a.job = restJob(a); S.stats.retreats++;
+  DBG.event('black ant retreats to heal', { id: a.id });
 }
 function updateDefender(a, dt) {
   const r = a.target;
@@ -695,7 +849,7 @@ function updateAnts(dt) {
     a.moving = false;
     if (a.age > a.life) { // old age: only when resting, and never if the colony is small
       if (S.ants.length > 14) {
-        S.ants.splice(i, 1); S.stats.died++;
+        S.ants.splice(i, 1); S.stats.died++; DBG.event('ant died of old age');
         S.corpses.push({ id: a.id, x: a.x, y: a.y + 5 * K, f: a.f, loc: a.loc, state: 'lying', claimed: false, decay: 0 });
         continue;
       }
@@ -810,21 +964,26 @@ function drawEgg(x, y, s) {
   g.fillStyle = 'rgba(255,255,255,0.9)'; g.beginPath(); g.arc(x - 1 * s, y - 0.9 * s, 0.8 * s, 0, 7); g.fill();
 }
 function drawLarva(b) {
-  const sz = (0.9 + b.fed * 0.17) * 1.7 * K, w = Math.sin(S.t * (b.hungry ? 7 : 2) + b.wig) * (b.hungry ? 0.18 : 0.06);
-  g.save(); g.translate(b.x, b.y - 4 * sz); g.scale(sz, sz); g.rotate(w);
+  const sz = (0.9 + b.fed * 0.17) * 1.7 * K;
+  let w = Math.sin(S.t * (b.hungry ? 7 : 2) + b.wig) * (b.hungry ? 0.18 : 0.06);
+  if (b.refuse > 0) w = Math.sin(S.t * 30) * 0.25 - 0.2;                  // shaking its head
+  const hop = b.happy > 0 ? -Math.abs(Math.sin(b.happy * 9)) * 3 * K : 0; // a happy little bounce
+  g.save(); g.translate(b.x, b.y - 4 * sz + hop); g.scale(sz, sz); g.rotate(w);
   g.fillStyle = '#f6edd3'; g.strokeStyle = 'rgba(190,160,110,0.8)'; g.lineWidth = 0.6;
   for (let k = 0; k < 7; k++) { // curled C of segments
     const a = Math.PI * 0.15 + k * 0.38, r = 4.2 - k * 0.25;
     g.beginPath(); g.arc(Math.cos(a) * 4.5, -Math.sin(a) * 3.2 + 1, r * 0.75, 0, 7); g.fill(); g.stroke();
   }
   g.fillStyle = '#3a2a1a'; g.beginPath(); g.arc(4.5, 0.2, 0.55, 0, 7); g.fill();
+  if (b.happy > 0) { g.strokeStyle = '#3a2a1a'; g.lineWidth = 0.45; g.beginPath(); g.arc(4.3, 1.2, 0.8, 0.2, Math.PI - 0.2); g.stroke();
+    g.fillStyle = 'rgba(255,120,140,0.6)'; g.beginPath(); g.arc(3.2, 1.6, 0.6, 0, 7); g.fill(); }
   g.restore();
-  if (b.hungry) { // thought bubble with a crumb
+  if (b.hungry) { // thought bubble showing its favourite food
     const bx = b.x + 10 * K, by = b.y - 36 * K + Math.sin(S.t * 3 + b.wig) * 1.5;
     g.fillStyle = 'rgba(255,255,255,0.88)';
     g.beginPath(); g.arc(b.x + 4 * K, b.y - 20 * K, 2 * K, 0, 7); g.fill();
     g.beginPath(); g.arc(bx, by, 10 * K, 0, 7); g.fill();
-    drawFoodBit('crumb', bx, by, 4.4 * K);
+    drawFoodBit(b.want, bx, by, 4.4 * K);
   }
 }
 function drawPupa(b) {
@@ -933,11 +1092,11 @@ function render() {
   }
   { // the queen
     const q = S.queen, qs = 3.3 * K, qp = floorPt(CH.Q, q.u, 6 * qs);
-    drawAnt(qp.x, qp.y, { f: QS, s: qs, col: '#2a1f1a', farCol: '#5a4a40', queen: true, pulse: q.pulse, ph: S.t * 0.6, moving: false, anim: 'groom' });
+    drawAnt(qp.x, qp.y - (q.happy > 0 ? Math.abs(Math.sin(q.happy * 6)) * 4 * K : 0), { f: QS, s: qs, col: '#2a1f1a', farCol: '#5a4a40', queen: true, pulse: q.pulse, ph: S.t * 0.6, moving: false, anim: 'groom' });
     if (q.hunger > 1) {
       const bx = qp.x + QS * 52 * K, by = qp.y - 58 * K + Math.sin(S.t * 2.5) * 2;
       g.fillStyle = 'rgba(255,255,255,0.88)'; g.beginPath(); g.arc(qp.x + QS * 38 * K, qp.y - 38 * K, 3 * K, 0, 7); g.fill();
-      g.beginPath(); g.arc(bx, by, 12 * K, 0, 7); g.fill(); drawFoodBit('berry', bx, by, 5.5 * K);
+      g.beginPath(); g.arc(bx, by, 12 * K, 0, 7); g.fill(); drawFoodBit(q.want, bx, by, 5.5 * K);
     }
   }
   for (const c of S.corpses) { // the dead, and the graveyard
@@ -1004,6 +1163,11 @@ function render() {
       g.font = `bold ${18 * K}px system-ui, sans-serif`; g.textAlign = 'center';
       g.lineWidth = 3 * K; g.strokeStyle = '#3a1a0a'; g.strokeText('!', p.x, p.y); g.fillStyle = '#ffe14d'; g.fillText('!', p.x, p.y);
     }
+    else if (p.k === 'nope') { // a little grey "no" cross
+      const r = 5 * K; g.strokeStyle = '#ffffff'; g.lineWidth = 4 * K; g.lineCap = 'round';
+      g.beginPath(); g.moveTo(p.x - r, p.y - r); g.lineTo(p.x + r, p.y + r); g.moveTo(p.x + r, p.y - r); g.lineTo(p.x - r, p.y + r); g.stroke();
+      g.strokeStyle = '#d9534f'; g.lineWidth = 2.2 * K; g.stroke();
+    }
     else if (p.k === 'chomp') { // little white "bite" burst
       g.strokeStyle = '#fff'; g.lineWidth = 1.6 * K; const r = (4 + t * 8) * K;
       g.beginPath(); for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5 + 0.3; g.moveTo(p.x + Math.cos(a) * r * 0.5, p.y + Math.sin(a) * r * 0.5); g.lineTo(p.x + Math.cos(a) * r, p.y + Math.sin(a) * r); } g.stroke();
@@ -1023,21 +1187,254 @@ function init() {
     const a = new Ant(loc, rand(40, life - 30), { life }); a.idleT = rand(0, 2.5); S.ants.push(a);
   }
   for (const s of STORES) for (let i = 0; i < 10; i++) S.stores[s].push(pick(Object.keys(FOOD)));
-  const mk = (nest, stage, slot, extra) => { const b = { id: uid++, stage, where: 'nursery', nest, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), ...extra }; S.nest[nest][slot] = b; S.brood.push(b); };
+  const mk = (nest, stage, slot, extra) => { const b = { id: uid++, stage, where: 'nursery', nest, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), want: pick(FOOD_TYPES), happy: 0, refuse: 0, ...extra }; S.nest[nest][slot] = b; S.brood.push(b); };
   mk('N1', 'egg', 0, { t: 6 }); mk('N1', 'larva', 2, { fed: 1, since: 5 }); mk('N1', 'larva', 4, { fed: 2, since: 2 }); mk('N1', 'pupa', 7, { t: 4 });
   mk('N2', 'larva', 1, { since: 6 }); mk('N2', 'egg', 3, { t: 10 }); mk('N2', 'pupa', 6, { t: 12, fed: 3 });
-  S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot: 0, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: 0 });
+  S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot: 0, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: 0, want: pick(FOOD_TYPES), happy: 0, refuse: 0 });
   for (let i = 0; i < 3; i++) { S.nextFood = 0; updateFood(0); }
   S.nextFood = 3;
+}
+
+// ---- Sound -------------------------------------------------------------------
+// Everything is synthesised with Web Audio: no sound files. There's rain, wind and
+// thunder, plus a gentle tune that turns to a darker minor version of itself
+// (slower, softer, lower) when it rains or storms. Browsers only allow audio after
+// the person interacts with the page, so the first click/tap or key press turns
+// sound on; the speaker button mutes it for the rest of the visit.
+const SND = (() => {
+  let ctx = null, master = null, music = null, noise = null, on = false, rainG, rainLow, windG, windF, tone;
+  let meter = null, dripAcc = 0, nextBar = 0, bar = 0, pass = 0, dark = 0, darkMode = false;
+  let pref = 'on'; // every visit starts with sound wanted; muting lasts until the page is reloaded
+  try { localStorage.removeItem('ants-sound'); } catch (e) { /* storage unavailable */ }
+  function build() {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return false;
+    ctx = new AC();
+    const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
+    master = ctx.createGain(); master.gain.value = 0.9; master.connect(comp); comp.connect(ctx.destination);
+    meter = ctx.createAnalyser(); meter.fftSize = 2048; comp.connect(meter);
+    tone = ctx.createBiquadFilter(); tone.type = 'lowpass'; tone.frequency.value = 3000; tone.Q.value = 0.5;
+    music = ctx.createGain(); music.gain.value = 1.1; tone.connect(music); music.connect(master);
+    const n = ctx.sampleRate * 3; noise = ctx.createBuffer(1, n, ctx.sampleRate); // 3 s of softened noise
+    const d = noise.getChannelData(0); let b = 0;
+    for (let i = 0; i < n; i++) { const w = Math.random() * 2 - 1; b = 0.97 * b + 0.03 * w; d[i] = w * 0.55 + b * 3; }
+    const loop = (lp, hp) => { const src = ctx.createBufferSource(); src.buffer = noise; src.loop = true; src.start(0, Math.random() * 2);
+      const f1 = ctx.createBiquadFilter(); f1.type = 'highpass'; f1.frequency.value = hp; const f2 = ctx.createBiquadFilter(); f2.type = 'lowpass'; f2.frequency.value = lp;
+      const g = ctx.createGain(); g.gain.value = 0; src.connect(f1); f1.connect(f2); f2.connect(g); g.connect(master); return [g, f2]; };
+    [rainG] = loop(7000, 900); [rainLow] = loop(1400, 200); [windG, windF] = loop(500, 40);
+    return true;
+  }
+  function setOn(v, remember = true) {
+    on = v;
+    if (remember) pref = v ? 'on' : 'off';
+    if (v) { if (!ctx && !build()) { on = false; return; } ctx.resume(); nextBar = 0; } else if (ctx) ctx.suspend();
+    if (v && ctx.state !== 'running') ctx.resume().then(() => updateButton()).catch(() => {});
+    DBG.event('sound', { on: v, byButton: remember });
+    updateButton();
+  }
+  const live = () => on && ctx && ctx.state === 'running' && !document.hidden;
+  function out(x, g, dest = master) {
+    const p = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+    if (p) { p.pan.value = x == null ? 0 : clamp((x - (visL + visR) / 2) / ((visR - visL) / 2), -1, 1) * 0.75; g.connect(p); p.connect(dest); } else g.connect(dest);
+  }
+  function hiss({ x, t = 0, dur = 0.05, type = 'bandpass', f = 3000, q = 1, gain = 0.1, attack = 0.002, f2 }) {
+    const t0 = ctx.currentTime + t, src = ctx.createBufferSource(); src.buffer = noise;
+    const fl = ctx.createBiquadFilter(); fl.type = type; fl.frequency.setValueAtTime(f, t0); fl.Q.value = q;
+    if (f2) fl.frequency.exponentialRampToValueAtTime(f2, t0 + dur);
+    const g = ctx.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.linearRampToValueAtTime(gain, t0 + attack); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(fl); fl.connect(g); out(x, g); src.start(t0, Math.random() * 2.5); src.stop(t0 + dur + 0.05);
+  }
+
+  // ---- the tune: 8 bars, [semitones from middle C, beats]; null = rest ----
+  const MELODY = [
+    [[4, 1], [7, 1], [9, 1], [7, 1]], [[4, 1.5], [2, 0.5], [0, 2]], [[2, 1], [4, 1], [7, 1], [4, 1]], [[2, 3], [null, 1]],
+    [[4, 1], [7, 1], [9, 1], [12, 1]], [[11, 1], [9, 1], [7, 2]], [[9, 1], [7, 1], [4, 1], [2, 1]], [[0, 3], [null, 1]],
+  ];
+  const CHORDS = [[0, 4, 7], [-3, 0, 4], [-5, -1, 2], [-5, -1, 2], [-7, -3, 0], [0, 4, 7], [-5, -1, 2], [0, 4, 7]]; // C Am G G F C G C
+  const minor = n => { const pc = ((n % 12) + 12) % 12; return pc === 4 || pc === 9 || pc === 11 ? n - 1 : n; }; // major -> C minor
+  const hz = n => 261.63 * Math.pow(2, n / 12);
+  function note(t, n, len, { gain = 0.08, type = 'triangle', attack = 0.02, release = 0.25 } = {}) {
+    const o = ctx.createOscillator(); o.type = type; o.frequency.value = hz(n);
+    const g = ctx.createGain(); g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + attack);
+    g.gain.setTargetAtTime(gain * 0.6, t + attack, len * 0.4); g.gain.setTargetAtTime(0, t + len, release / 3);
+    o.connect(g); g.connect(tone); o.start(t); o.stop(t + len + release + 0.1);
+  }
+  function scheduleBar(t) {
+    const beat = 60 / lerp(84, 66, dark);             // slower when it's gloomy
+    const shift = darkMode ? -12 : 0, mel = MELODY[bar], ch = CHORDS[bar];
+    const tr = n => (darkMode ? minor(n) : n);
+    // soft pad chord and a bass note on beats 1 and 3
+    for (const n of ch) note(t, tr(n) - 12, beat * 4, { gain: 0.022, type: 'sine', attack: 0.5, release: 0.8 });
+    for (const b of [0, 2]) note(t + b * beat, tr(ch[0]) - 24, beat * 1.6, { gain: 0.07, type: 'sine', attack: 0.02, release: 0.4 });
+    if (pass % 3 === 2) { // every third time round: a quieter interlude of broken chords
+      for (let k = 0; k < 4; k++) if (Math.random() < 0.8) note(t + k * beat, tr(pick(ch)) + shift + (darkMode ? 0 : 12), beat * 0.9, { gain: 0.04 });
+    } else {
+      let at = 0;
+      for (const [n, len] of mel) {
+        if (n != null) note(t + at * beat, tr(n) + shift + (pass % 3 === 1 && !darkMode && bar >= 4 ? 12 : 0), len * beat * 0.95, { gain: darkMode ? 0.075 : 0.065 });
+        at += len;
+      }
+    }
+    bar = (bar + 1) % MELODY.length; if (!bar) pass++;
+    return beat * 4;
+  }
+  function tick(dt) {
+    if (!live()) return;
+    const now = ctx.currentTime, rain = Wx.rain, storm = Wx.storm;
+    rainG.gain.setTargetAtTime(rain * 0.09 + storm * 0.035, now, 0.6);
+    rainLow.gain.setTargetAtTime(rain * 0.07 + storm * 0.035, now, 0.6);
+    windG.gain.setTargetAtTime(storm * 0.22, now, 0.8);
+    windF.frequency.setTargetAtTime(300 + Math.sin(now * 0.7) * 120 + storm * 150, now, 0.3);
+    dripAcc += rain * 18 * dt; // single raindrops on leaves
+    while (dripAcc >= 1) { dripAcc -= 1; hiss({ x: rand(visL, visR), t: Math.random() * 0.05, dur: 0.03, f: rand(1800, 5000), q: 6, gain: rand(0.012, 0.035) }); }
+    // music: darkness follows the weather; the tune switches key only at a bar line
+    dark = clamp(rain * 0.9 + storm * 0.5, 0, 1);
+    tone.frequency.setTargetAtTime(lerp(3200, 900, dark), now, 1.5);
+    music.gain.setTargetAtTime(lerp(1.1, 0.85, dark), now, 1.5);
+    if (nextBar < now) nextBar = now + 0.15;
+    while (nextBar < now + 0.4) {
+      if (!darkMode && dark > 0.35) darkMode = true; else if (darkMode && dark < 0.2) darkMode = false;
+      nextBar += scheduleBar(nextBar);
+    }
+  }
+  function thunder(x) {
+    if (!live()) return;
+    const delay = rand(0.05, 0.5);
+    hiss({ x, t: delay, dur: 0.35, type: 'highpass', f: 1200, gain: 0.2, attack: 0.003 });           // crack
+    hiss({ x, t: delay + 0.02, dur: 0.6, type: 'lowpass', f: 900, f2: 200, gain: 0.32, attack: 0.01 });
+    const t0 = ctx.currentTime + delay + 0.05, len = rand(3, 4.5), src = ctx.createBufferSource(); src.buffer = noise; src.loop = true;
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.setValueAtTime(260, t0); lp.frequency.exponentialRampToValueAtTime(90, t0 + len); lp.Q.value = 0.8;
+    const g = ctx.createGain(), curve = new Float32Array(64); // the long rolling rumble
+    for (let i = 0; i < 64; i++) { const u = i / 63; curve[i] = 0.75 * Math.min(1, u * 12) * Math.pow(1 - u, 1.6) * (0.6 + 0.4 * Math.random()); }
+    curve[63] = 0; g.gain.setValueAtTime(0, t0); g.gain.setValueCurveAtTime(curve, t0, len);
+    src.connect(lp); lp.connect(g); out(x, g); src.start(t0, Math.random()); src.stop(t0 + len + 0.1);
+  }
+  document.addEventListener('visibilitychange', () => { if (!ctx) return; if (document.hidden) ctx.suspend(); else if (on) ctx.resume(); });
+  addEventListener('pointerdown', e => { if (!on && pref === 'on' && !(e.target.closest && e.target.closest('#ui'))) setOn(true, false); });
+  addEventListener('keydown', () => { if (!on && pref === 'on') setOn(true, false); });
+  function level() { // RMS of what's playing right now (for tests and the debug log)
+    if (!meter) return 0; const a = new Float32Array(meter.fftSize); meter.getFloatTimeDomainData(a);
+    let s = 0; for (const v of a) s += v * v; return Math.sqrt(s / a.length);
+  }
+  // Try to start straight away. Browsers that allow it (e.g. Chrome on a site where
+  // you've played sound before) start playing; others wait for the first click/tap.
+  function autoStart() {
+    if (pref !== 'on' || on || !build()) return;
+    ctx.resume().catch(() => {});
+    const check = () => { if (!on && pref === 'on' && ctx.state === 'running') { on = true; nextBar = 0; DBG.event('sound', { on: true, auto: true }); updateButton(); } };
+    ctx.onstatechange = check; setTimeout(check, 300);
+  }
+  return { tick, thunder, setOn, level, autoStart, get muted() { return pref === 'off'; }, get on() { return on; }, get state() { return ctx ? ctx.state : 'none'; } };
+})();
+const ICON = {
+  on: '<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>',
+  off: '<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M17 9.5l5 5M22 9.5l-5 5"/></svg>',
+  fs: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg>',
+  unfs: '<svg viewBox="0 0 24 24"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5"/></svg>',
+};
+const sndBtn = document.getElementById('snd'), fsBtn = document.getElementById('fs');
+function updateButton() {
+  // The icon shows what you chose: sound is on unless you muted it, even while the
+  // browser is still waiting for the first click before it lets anything play.
+  const on = !SND.muted; sndBtn.innerHTML = on ? ICON.on : ICON.off;
+  if (SND.on) document.getElementById('hint').hidden = true;
+  sndBtn.setAttribute('aria-label', on ? 'Mute sound' : 'Turn sound on'); sndBtn.title = on ? 'Sound on' : 'Sound off';
+}
+sndBtn.addEventListener('click', () => SND.setOn(SND.muted || !SND.on)); // waiting for a click? this click starts it
+// Until sound has started, a friendly pill invites a click/tap (browsers need one).
+const hintBtn = document.getElementById('hint');
+hintBtn.textContent = COARSE ? '♪ Tap for music' : '♪ Click for music';
+hintBtn.addEventListener('click', () => SND.setOn(true));
+setTimeout(() => { if (!SND.on && !SND.muted) hintBtn.hidden = false; }, 1200);
+updateButton();
+SND.autoStart();
+// Full-screen button for PCs (phones and tablets go full screen on tap instead).
+if (!COARSE && document.documentElement.requestFullscreen) {
+  fsBtn.hidden = false;
+  const fsIcon = () => { const f = !!document.fullscreenElement; fsBtn.innerHTML = f ? ICON.unfs : ICON.fs; fsBtn.setAttribute('aria-label', f ? 'Exit full screen' : 'Full screen'); fsBtn.title = f ? 'Exit full screen' : 'Full screen'; };
+  fsBtn.addEventListener('click', () => { (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => {}); });
+  document.addEventListener('fullscreenchange', fsIcon); fsIcon();
 }
 
 // ---- Main loop -----------------------------------------------------------
 let last = performance.now();
 function frame(now) {
-  let dt = Math.min(0.1, (now - last) / 1000) * SPEED; last = now;
-  while (dt > 0) { const h = Math.min(dt, 1 / 30); update(h); dt -= h; }
-  render();
   requestAnimationFrame(frame);
+  const raw = now - last; last = now;
+  let dt = Math.min(0.1, raw / 1000) * SPEED;
+  try {
+    while (dt > 0) { const h = Math.min(dt, 1 / 30); update(h); dt -= h; }
+    render();
+  } catch (e) {
+    if (!MON.errs++ || MON.errs % 100 === 0) DBG.record('error', 'frame: ' + e.message, { stack: e.stack, count: MON.errs, state: debugState() });
+  }
+  debugTick(raw);
+  SND.tick(Math.min(0.1, raw / 1000));
+}
+
+// ---- Debug monitoring: periodic snapshots and anomaly checks ------------------
+const MON = { frames: 0, slow: 0, worst: 0, since: performance.now(), lastSnap: 0, lastCheck: 0, seen: new Set(), still: new Map(), corpseSeen: new Map(), stormSince: null, errs: 0 };
+function antInfo(a) {
+  return { id: a.id, red: a.red || undefined, x: Math.round(a.x), y: Math.round(a.y), loc: a.loc, mode: a.mode, fighting: a.fighting || undefined,
+    hp: Math.round(a.hp), age: Math.round(a.age), carry: a.carry && a.carry.kind, path: a.path.length,
+    job: a.job && { step: a.job.i, steps: a.job.steps.map(s => s.t).join(','), idle: !!a.job.idle } };
+}
+function debugState() {
+  const count = (arr, f) => arr.filter(f).length, el = (performance.now() - MON.since) / 1000;
+  return {
+    simT: Math.round(S.t), day: +S.day.toFixed(3), speed: SPEED,
+    weather: { state: Wx.state, left: Math.round(Wx.left), cover: +Wx.cover.toFixed(2), rain: +Wx.rain.toFixed(2), storm: +Wx.storm.toFixed(2) },
+    ants: S.ants.length, outside: count(S.ants, onSurface), defending: count(S.ants, a => a.mode === 'defend'), invaders: S.invaders.length,
+    brood: { eggsQ: count(S.brood, b => b.where === 'queen'), eggs: count(S.brood, b => b.where === 'nursery' && b.stage === 'egg'),
+      larvae: count(S.brood, b => b.stage === 'larva'), hungry: count(S.brood, b => b.hungry), pupae: count(S.brood, b => b.stage === 'pupa') },
+    stores: { F1: S.stores.F1.length, F2: S.stores.F2.length }, food: S.food.length, queenHunger: +S.queen.hunger.toFixed(2),
+    corpses: { lying: count(S.corpses, c => c.state === 'lying'), carried: count(S.corpses, c => c.state === 'carried'), grave: count(S.corpses, c => c.state === 'grave') },
+    stats: S.stats, fps: Math.round(MON.frames / Math.max(0.001, el)), slowFrames: MON.slow, worstMs: Math.round(MON.worst),
+    view: { w: cw, h: chh, rot: ROT, phone: PHONE, scale: +scale.toFixed(3) }, hidden: document.hidden, sound: SND.on ? SND.state : 'off',
+  };
+}
+function once(key, msg, data) { if (MON.seen.has(key)) return; MON.seen.add(key); DBG.anomaly(msg, data); }
+function checkAnomalies() {
+  for (const a of S.ants.concat(S.invaders)) if (!Number.isFinite(a.x) || !Number.isFinite(a.y)) once('nan' + a.id, 'non-finite position', antInfo(a));
+  // an ant that should be walking (or chasing) but hasn't taken a step for 25 sim-seconds
+  const alive = new Set();
+  for (const a of S.ants.concat(S.invaders)) {
+    alive.add(a.id);
+    const p = MON.still.get(a.id); // compare distance walked, not position (tunnels are narrow)
+    if (!p || a.odo - p.odo > 2) { MON.still.set(a.id, { odo: a.odo, t: S.t }); continue; }
+    const wantsToMove = a.path.length > 0 || (a.mode === 'defend' && !a.fighting) || (a.red && !a.fleeing && a.path.length);
+    if (wantsToMove && S.t - p.t > 25) once('stuck' + a.id + '@' + Math.round(p.t), 'ant not moving', antInfo(a));
+  }
+  for (const id of MON.still.keys()) if (!alive.has(id)) MON.still.delete(id);
+  if (stormy()) {
+    MON.stormSince = MON.stormSince ?? S.t;
+    if (S.t - MON.stormSince > 25) {
+      const out = S.ants.filter(onSurface);
+      if (out.length) once('stormout' + Math.round(MON.stormSince), 'ants outside during storm', out.slice(0, 6).map(antInfo));
+      const raiders = S.invaders.filter(r => !r.fleeing);
+      if (raiders.length) once('stormraid' + Math.round(MON.stormSince), 'raiders not fleeing in storm', raiders.map(antInfo));
+    }
+  } else MON.stormSince = null;
+  for (const r of S.invaders) if (S.t - r.spawnT > 150) once('longraid' + r.id, 'red ant around for 150 s', { ant: antInfo(r), defenders: S.ants.filter(a => a.target === r).map(antInfo) });
+  const ids = new Set();
+  for (const c of S.corpses) {
+    ids.add(c.id + (c.red ? 'r' : ''));
+    if (c.state !== 'lying') { MON.corpseSeen.delete(c.id + (c.red ? 'r' : '')); continue; }
+    const k = c.id + (c.red ? 'r' : ''), t0 = MON.corpseSeen.get(k) ?? S.t; MON.corpseSeen.set(k, t0);
+    if (!stormy() && S.t - t0 > 240) once('corpse' + k, 'body not buried after 240 s', { x: Math.round(c.x), y: Math.round(c.y), loc: c.loc, claimed: c.claimed, red: !!c.red });
+  }
+  for (const k of MON.corpseSeen.keys()) if (!ids.has(k)) MON.corpseSeen.delete(k);
+  for (const b of S.brood) if (b.hungry && b.since > 150) once('hungry' + b.id, 'larva hungry for 150 s', { nest: b.nest, slot: b.slot, fed: b.fed, want: b.want, inStore: stocked(b.want), onGround: S.food.filter(f => f.type === b.want).length, claimed: b.claimed, stores: S.stores.F1.length + S.stores.F2.length });
+  if (S.ants.length < 12) once('poplow' + Math.floor(S.t / 300), 'population low', { ants: S.ants.length, brood: S.brood.length });
+}
+function debugTick(rawMs) {
+  if (!DBG.on) return;
+  const t = performance.now();
+  MON.frames++;
+  if (!document.hidden && rawMs > 250) { MON.slow++; MON.worst = Math.max(MON.worst, rawMs); if (rawMs > 1500) DBG.record('stall', 'long frame', { ms: Math.round(rawMs) }); }
+  try {
+    if (t - MON.lastCheck > 2000) { MON.lastCheck = t; checkAnomalies(); }
+    if (t - MON.lastSnap > 15000) { MON.lastSnap = t; DBG.snapshot(debugState()); MON.frames = 0; MON.slow = 0; MON.worst = 0; MON.since = t; }
+  } catch (e) { DBG.record('error', 'debug: ' + e.message, { stack: e.stack }); }
 }
 // On phones/tablets, a tap goes full screen and locks landscape where the browser allows it.
 addEventListener('pointerup', () => {
@@ -1046,8 +1443,11 @@ addEventListener('pointerup', () => {
     .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
 });
 addEventListener('resize', resize);
+DBG.init();
 resize(); init();
-window.__sim = { S, Wx, update, render, N, CH, spawnRaid, setWeather };
+DBG.event('session start', { build: '__BUILD__', weather: Wx.state, view: { w: cw, h: chh, rot: ROT, phone: PHONE } });
+DBG.snapshot(debugState());
+window.__sim = { S, Wx, update, render, N, CH, spawnRaid, setWeather, DBG, debugState, SND };
 requestAnimationFrame(frame);
 </script>
 </body>
