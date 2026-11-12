@@ -35,6 +35,8 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 function hx(c) { return [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)); }
 function mix(a, b, t) { const A = hx(a), B = hx(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(',')})`; }
+const mixA = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const rgb = (a, al = 1) => `rgba(${a.map(Math.round).join(',')},${al})`;
 function mulberry(s) { return () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 
 // ---- Colony layout -------------------------------------------------------
@@ -187,7 +189,8 @@ function buildBg() {
 // ---- Scenery (sky, clouds, grass, flowers) ------------------------------
 const SR = mulberry(42);
 const stars = Array.from({ length: 90 }, () => ({ x: -900 + SR() * 3400, y: -1200 + SR() * (SURF + 1150), r: 0.6 + SR() * 1.4, p: SR() * 6 }));
-const clouds = Array.from({ length: 6 }, () => ({ x: SR() * 2400 - 400, y: 120 + SR() * 60, s: 0.45 + SR() * 0.5, v: 6 + SR() * 8 }));
+const PUFFS = [[0, 0, 26], [30, -10, 32], [62, 0, 24], [30, 10, 26], [88, 4, 20]];
+const clouds = Array.from({ length: 16 }, () => ({ x: SR() * 2600 - 500, y: 112 + SR() * 70, s: 0.45 + SR() * 0.5, v: 6 + SR() * 8 }));
 const blades = [];
 for (let x = -1400; x < 3000; x += 3.2 + SR() * 3) {
   if (Math.abs(x - 800) < 62 * K) continue;
@@ -206,11 +209,64 @@ const SKY = [ // [phase, top, bottom]
 function skyAt(p) {
   for (let i = 1; i < SKY.length; i++) if (p <= SKY[i][0]) {
     const [p0, t0, b0] = SKY[i - 1], [p1, t1, b1] = SKY[i], t = (p - p0) / (p1 - p0 || 1);
-    return [mix(t0, t1, t), mix(b0, b1, t)];
+    return [mixA(hx(t0), hx(t1), t), mixA(hx(b0), hx(b1), t)];
   }
-  return [SKY[0][1], SKY[0][2]];
+  return [hx(SKY[0][1]), hx(SKY[0][2])];
 }
 const DAY_LEN = 300;
+// ---- Weather -----------------------------------------------------------------
+// Sunny -> cloudy -> rain -> thunderstorm and back. Each state has target levels for
+// cloud cover, rain and storminess; the live levels drift towards them slowly, so
+// each change takes roughly 10-20 seconds. In a thunderstorm the ants stay in,
+// nobody forages, and red ants don't raid.
+const WEATHER = {
+  sunny: { cover: 0.28, rain: 0, storm: 0, dur: [100, 200], next: ['cloudy'] },
+  cloudy: { cover: 0.75, rain: 0, storm: 0, dur: [60, 120], next: ['sunny', 'sunny', 'rain'] },
+  rain: { cover: 0.92, rain: 0.6, storm: 0, dur: [60, 120], next: ['cloudy', 'storm', 'storm'] },
+  storm: { cover: 1, rain: 1, storm: 1, dur: [50, 90], next: ['rain'] },
+};
+const Wx = { state: WEATHER[params.get('weather')] ? params.get('weather') : 'sunny', left: 0, cover: 0, rain: 0, storm: 0, wind: 0, drops: [], splashes: [], bolts: [], flash: 0, boltT: 3 };
+Object.assign(Wx, (({ cover, rain, storm }) => ({ cover, rain, storm }))(WEATHER[Wx.state]), { left: rand(...WEATHER[Wx.state].dur) });
+const stormy = () => Wx.state === 'storm';
+function setWeather(st) { Wx.state = st; Wx.left = rand(...WEATHER[st].dur); }
+function updateWeather(dt) {
+  Wx.left -= dt;
+  if (Wx.left <= 0) setWeather(pick(WEATHER[Wx.state].next));
+  const w = WEATHER[Wx.state], toward = (v, t, rate) => v + clamp(t - v, -rate * dt, rate * dt);
+  Wx.cover = toward(Wx.cover, w.cover, 1 / 23);
+  Wx.rain = toward(Wx.rain, w.rain, 1 / 20);
+  Wx.storm = toward(Wx.storm, w.storm, 1 / 20);
+  Wx.wind = 30 + Wx.storm * 170;
+  // raindrops fall through the sky and splash on the grass
+  let n = Math.pow(Wx.rain, 1.5) * 900 * dt;
+  for (; n > 0; n--) if (Math.random() < n) Wx.drops.push({ x: rand(visL - 120, visR + 20), y: rand(visT - 40, visT), v: rand(620, 780) });
+  for (let i = Wx.drops.length - 1; i >= 0; i--) {
+    const d = Wx.drops[i]; d.y += d.v * dt; d.x += Wx.wind * dt;
+    if (d.y >= SURF) { Wx.drops.splice(i, 1); if (Math.random() < 0.4) Wx.splashes.push({ x: d.x, age: 0 }); }
+  }
+  for (let i = Wx.splashes.length - 1; i >= 0; i--) if ((Wx.splashes[i].age += dt) > 0.25) Wx.splashes.splice(i, 1);
+  // lightning
+  Wx.flash = Math.max(0, Wx.flash - dt * 2.5);
+  for (let i = Wx.bolts.length - 1; i >= 0; i--) if ((Wx.bolts[i].age += dt) > 0.45) Wx.bolts.splice(i, 1);
+  if (Wx.storm > 0.6) {
+    Wx.boltT -= dt;
+    if (Wx.boltT <= 0) { Wx.boltT = rand(2.5, 8); Wx.bolts.push(makeBolt()); Wx.flash = 1; }
+  }
+}
+function makeBolt() {
+  const main = [], branches = [];
+  let x = rand(visL + 80, visR - 80), y = visT - 5;
+  main.push([x, y]);
+  while (y < SURF) {
+    y = Math.min(SURF, y + rand(14, 28)); x += rand(-16, 16); main.push([x, y]);
+    if (Math.random() < 0.18 && y < SURF - 50) { // a short fork
+      const b = [[x, y]]; let bx = x, by = y;
+      for (let k = 0; k < 3; k++) { bx += rand(-22, 22) + (Math.random() < .5 ? -8 : 8); by += rand(12, 22); b.push([bx, by]); }
+      branches.push(b);
+    }
+  }
+  return { main, branches, age: 0 };
+}
 function nightness(p) { // 0 = full day, 1 = full night
   if (p < 0.52) return 0; if (p < 0.68) return (p - 0.52) / 0.16; if (p < 0.9) return 1; if (p < 1) return 1 - (p - 0.9) / 0.1; return 0;
 }
@@ -310,9 +366,32 @@ function idleJob(a) {
   if (a.age < 30 || r < 0.35) { const n = pick(NESTS); dest = { node: n, u: rand(-0.75, 0.75) }; anim = 'tend'; }
   else if (r < 0.55) { const s = pick(STORES); dest = { node: s, u: storeDropU(s) }; }
   else if (r < 0.7) dest = { node: 'Q', u: QS * rand(0.45, 0.85) };
-  else if (r < 0.85) dest = { node: 'E', sx: clamp(rand(450, 1250), visL + 40, Math.min(1330, visR - 40)) };
+  else if (r < 0.85 && !stormy()) dest = { node: 'E', sx: clamp(rand(450, 1250), visL + 40, Math.min(1330, visR - 40)) };
   else dest = { node: pick(['A', 'B', 'C']) };
   return { idle: true, steps: [go(dest), wait(rand(1.5, 4), anim)] };
+}
+function shelterJob(a) { // storm: hurry inside and wait it out
+  const r = Math.random(), id = r < 0.45 ? pick(NESTS) : r < 0.8 ? pick(STORES) : 'Q';
+  const u = id === 'Q' ? QS * rand(0.45, 0.85) : rand(-0.7, 0.7);
+  return { idle: true, steps: [go({ node: id, u }), wait(rand(2, 4), 'groom')] };
+}
+// When a thunderstorm starts, everyone outside (or on the way out) heads in. Foragers
+// already carrying food keep going to the store; a body being carried to the graveyard
+// is put down until the storm passes.
+function stormShelter() {
+  for (const a of S.ants) {
+    if (a.mode) continue;
+    const headingOut = a.path.length > 0 && a.path[a.path.length - 1].loc.sx != null;
+    if (!headingOut && !onSurface(a)) continue;
+    if (!headingOut && a.job && a.carry && a.carry.kind === 'food') continue;
+    if (a.carry && a.carry.kind === 'corpse') {
+      const c = a.carry.c; Object.assign(c, { state: 'lying', x: a.x, y: a.y + 5 * K, f: a.f, loc: onSurface(a) ? { node: 'E', sx: a.x } : a.loc });
+      a.carry = null;
+    }
+    a.abort();
+    if (onSurface(a)) a.loc = { node: 'E', sx: a.x };
+    a.job = shelterJob(a);
+  }
 }
 function restJob(a) { // a hurt ant goes home to rest and heal
   const n = pick(NESTS);
@@ -403,7 +482,7 @@ function buryJob(a, c) {
 function chooseJob(a) {
   const q = S.queen, grown = a.age > 35;
   const corpse = S.corpses.find(c => c.state === 'lying' && !c.claimed);
-  if (corpse && grown && Math.random() < 0.75) return buryJob(a, corpse);
+  if (corpse && grown && !stormy() && Math.random() < 0.75) return buryJob(a, corpse);
   const egg = S.brood.find(b => b.where === 'queen' && !b.claimed);
   if (egg && Math.random() < 0.75 && freeSlot()) return eggJob(a, egg);
   if (storeTotal() && q.hunger > 1 && !q.claimed && Math.random() < 0.8) return feedQueenJob(a);
@@ -412,7 +491,7 @@ function chooseJob(a) {
     const near = hungry.filter(b => b.nest === nestOf(a.loc));
     return feedLarvaJob(a, pick(near.length ? near : hungry));
   }
-  if (grown && storeTotal() < STORE_CAP * 2 - 6) {
+  if (grown && !stormy() && storeTotal() < STORE_CAP * 2 - 6) {
     const foragers = S.ants.filter(x => x.carry && x.carry.kind === 'food').length;
     const avail = S.food.filter(f => f.bites - f.claims > 0);
     if (avail.length && foragers < 14 && Math.random() < 0.75) {
@@ -471,7 +550,7 @@ function updateFood(dt) {
   const night = nightness(S.day);
   if (S.nextFood <= 0) {
     S.nextFood = rand(4, 7) * (night > 0.5 ? 2.5 : 1);
-    if (S.food.length < 6) {
+    if (S.food.length < 6 && !stormy()) {
       const lo = Math.max(60, visL + 50), hi = Math.min(1320, visR - 50);
       let x, tries = 0;
       do { x = rand(lo, hi); tries++; } while ((Math.abs(x - 800) < 90 || S.food.some(f => Math.abs(f.x - x) < 60)) && tries < 20);
@@ -508,8 +587,20 @@ function killRed(r) {
 }
 function updateRaids(dt) {
   S.nextRaid -= dt;
-  if (S.nextRaid <= 0) { S.nextRaid = rand(50, 100); spawnRaid(); }
+  if (S.nextRaid <= 0) {
+    if (stormy() || WEATHER[Wx.state].storm) S.nextRaid = rand(15, 30); // nobody raids in a storm
+    else { S.nextRaid = rand(50, 100); spawnRaid(); }
+  }
   for (const r of S.invaders.slice()) {
+    if (stormy() && !r.fleeing) { // red ants run home from the storm
+      r.fleeing = true;
+      r.path = buildPath(r.path.length ? r.path[0].loc : r.loc, { node: 'E', sx: r.side < 0 ? visL - 80 : visR + 80 });
+    }
+    if (r.fleeing) {
+      r.move(dt, 1.5);
+      if (!r.path.length) { S.invaders.splice(S.invaders.indexOf(r), 1); r.gone = true; }
+      continue;
+    }
     r.lunge = Math.max(0, r.lunge - dt);
     const fighters = attackersOf(r).filter(a => a.fighting);
     if (fighters.length) {
@@ -562,7 +653,7 @@ function retreat(a) {
 }
 function updateDefender(a, dt) {
   const r = a.target;
-  if (!r || r.gone) {
+  if (!r || r.gone || r.fleeing) {
     a.mode = null; a.target = null; a.path = []; a.fighting = false; a.hop = 0.6; a.moving = false;
     a.idleT = rand(0.4, 1.2);
     return;
@@ -625,7 +716,9 @@ function updateCorpses(dt) {
 }
 function update(dt) {
   S.t += dt; S.day = (S.day + dt / DAY_LEN) % 1;
-  for (const c of clouds) { c.x += c.v * dt; if (c.x > visR + 200) c.x = visL - 200; }
+  for (const c of clouds) { c.x += (c.v + Wx.storm * 25) * dt; if (c.x > visR + 200) c.x = visL - 260; }
+  updateWeather(dt);
+  if (stormy()) stormShelter();
   updateQueen(dt); updateBrood(dt); updateFood(dt); updateRaids(dt); updateAnts(dt); updateCorpses(dt);
   for (let i = S.parts.length - 1; i >= 0; i--) {
     const p = S.parts[i]; p.age += dt; if (p.age < 0) continue;
@@ -777,16 +870,21 @@ function antDraw(a) {
 }
 
 function render() {
-  const p = S.day, night = nightness(p), [top, bot] = skyAt(p);
+  const p = S.day, night = nightness(p);
+  let [top, bot] = skyAt(p);
+  const grey = Math.min(0.9, Wx.cover * 0.5 + Wx.rain * 0.15 + Wx.storm * 0.25);
+  top = mixA(top, mixA(mixA([118, 128, 142], [62, 68, 82], Wx.storm), [24, 28, 40], night), grey);
+  bot = mixA(bot, mixA(mixA([168, 176, 186], [98, 106, 120], Wx.storm), [40, 46, 58], night), grey);
+  top = mixA(top, [225, 232, 255], Wx.flash * 0.55); bot = mixA(bot, [235, 240, 255], Wx.flash * 0.55);
   screenT(g);
   const surfScr = offY + SURF * scale;
   const sg = g.createLinearGradient(0, 0, 0, surfScr);
-  sg.addColorStop(0, top); sg.addColorStop(1, bot);
+  sg.addColorStop(0, rgb(top)); sg.addColorStop(1, rgb(bot));
   g.fillStyle = sg; g.fillRect(0, 0, cw, surfScr + 2);
   worldT(g);
   if (night > 0.05) { // stars
     g.fillStyle = '#fff';
-    for (const s of stars) { if (s.y > SURF - 20 || s.y < visT - 5) continue; g.globalAlpha = night * (0.5 + 0.5 * Math.sin(S.t * 1.5 + s.p)); g.beginPath(); g.arc(s.x, s.y, s.r, 0, 7); g.fill(); }
+    for (const s of stars) { if (s.y > SURF - 20 || s.y < visT - 5) continue; g.globalAlpha = night * (1 - Wx.cover * 0.95) * (0.5 + 0.5 * Math.sin(S.t * 1.5 + s.p)); g.beginPath(); g.arc(s.x, s.y, s.r, 0, 7); g.fill(); }
     g.globalAlpha = 1;
   }
   const skyH = SURF - visT;
@@ -798,14 +896,23 @@ function render() {
     g.fillStyle = col; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
     return { x, y };
   };
+  g.globalAlpha = clamp(1.2 - Wx.cover * 1.1 - Wx.storm, 0, 1); // sun & moon fade behind cloud
   if (p < 0.64) arc((p + 0.04) / 0.68, '#ffe14d', 26, 'rgba(255,230,120,0.5)');
   if (p > 0.6) { const m = arc((p - 0.6) / 0.42, '#f4f1e1', 20, 'rgba(220,230,255,0.35)'); g.fillStyle = 'rgba(180,180,170,0.35)'; g.beginPath(); g.arc(m.x - 6, m.y - 4, 4, 0, 7); g.arc(m.x + 5, m.y + 5, 2.8, 0, 7); g.fill(); }
-  g.fillStyle = `rgba(255,255,255,${0.9 - night * 0.65})`; // clouds
-  for (const c of clouds) {
-    const cy = Math.max(c.y, visT + 30 * c.s);
-    g.save(); g.translate(c.x, cy); g.scale(c.s, c.s); g.beginPath();
-    g.arc(0, 0, 26, 0, 7); g.arc(30, -10, 32, 0, 7); g.arc(62, 0, 24, 0, 7); g.arc(30, 10, 26, 0, 7); g.fill(); g.restore();
-  }
+  g.globalAlpha = 1;
+  // clouds: more, bigger and greyer as the weather closes in
+  let cc = mixA([255, 255, 255], [160, 167, 178], clamp((Wx.cover - 0.35) / 0.55, 0, 1));
+  cc = mixA(cc, [88, 95, 108], Wx.storm);
+  cc = mixA(cc, [70, 78, 104], night * 0.6);
+  cc = mixA(cc, [240, 244, 255], Wx.flash * 0.7);
+  clouds.forEach((c, i) => {
+    const al = clamp((Wx.cover * 1.08 - i / clouds.length) * 5, 0, 1); if (al <= 0) return;
+    const s = c.s * (1 + Wx.cover * 0.7), cy = clamp(c.y, visT + 30 * s, SURF - 45 * s);
+    g.fillStyle = rgb(mixA(cc, [255, 255, 255], (i % 3) * 0.04), al * (0.92 - night * 0.3));
+    g.save(); g.translate(c.x, cy); g.scale(s, s); g.beginPath();
+    for (const [x, y, r] of PUFFS) { g.moveTo(x + r, y); g.arc(x, y, r, 0, 7); }
+    g.fill(); g.restore();
+  });
   g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(bg, 0, 0); // ground layer
   worldT(g);
   for (const id of STORES) { // food piles
@@ -847,7 +954,7 @@ function render() {
     g.strokeStyle = BLADE_COL[c]; g.beginPath();
     for (const b of blades) {
       if (b.c !== c || b.x < visL - 20 || b.x > visR + 20) continue;
-      const sway = Math.sin(S.t * 1.4 + b.ph + b.x * 0.01) * 2.5 + b.lean;
+      const sway = Math.sin(S.t * (1.4 + Wx.storm * 2) + b.ph + b.x * 0.01) * (2.5 + Wx.storm * 3) + b.lean + Wx.storm * 5;
       g.moveTo(b.x, SURF + 2); g.quadraticCurveTo(b.x + sway * 0.25, SURF - b.h * 0.5, b.x + sway, SURF - b.h);
     }
     g.stroke();
@@ -866,6 +973,23 @@ function render() {
   }
   for (const a of S.ants) antDraw(a);
   for (const r of S.invaders) antDraw(r);
+  if (Wx.drops.length) { // rain
+    g.strokeStyle = 'rgba(205,220,240,0.55)'; g.lineWidth = 1.3; g.lineCap = 'round'; g.beginPath();
+    const dx = Wx.wind * 0.022;
+    for (const d of Wx.drops) { g.moveTo(d.x, d.y); g.lineTo(d.x - dx, d.y - 15); }
+    g.stroke();
+    g.strokeStyle = 'rgba(215,228,245,0.6)'; g.lineWidth = 1; g.beginPath();
+    for (const sp of Wx.splashes) { const r = 2 + sp.age * 22; g.moveTo(sp.x - r, SURF - sp.age * 10); g.quadraticCurveTo(sp.x, SURF - 3 - sp.age * 14, sp.x + r, SURF - sp.age * 10); }
+    g.stroke();
+  }
+  for (const b of Wx.bolts) { // lightning
+    const al = (1 - b.age / 0.45) * (b.age % 0.12 < 0.08 ? 1 : 0.4);
+    for (const [w, col] of [[16, `rgba(170,190,255,${0.3 * al})`], [7, `rgba(200,215,255,${0.5 * al})`], [3.4, `rgba(255,255,255,${al})`]]) {
+      g.strokeStyle = col; g.lineWidth = w; g.lineJoin = 'round'; g.lineCap = 'round';
+      for (const line of [b.main, ...b.branches]) { g.beginPath(); line.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.stroke(); }
+      g.lineWidth = w * 0.6;
+    }
+  }
   for (const a of S.ants) if (a.showHp) drawHealth(a.x, a.y - 22 * K, a.hp);
   for (const r of S.invaders) if (r.showHp) drawHealth(r.x, r.y - 24 * K, r.hp);
   for (const p of S.parts) { // particles
@@ -886,6 +1010,7 @@ function render() {
     }
   }
   g.globalAlpha = 1;
+  if (Wx.flash > 0.01) { screenT(g); g.fillStyle = `rgba(235,240,255,${Wx.flash * 0.16})`; g.fillRect(0, 0, cw, chh); }
 }
 
 // ---- Initial colony --------------------------------------------------------
@@ -922,7 +1047,7 @@ addEventListener('pointerup', () => {
 });
 addEventListener('resize', resize);
 resize(); init();
-window.__sim = { S, update, render, N, CH, spawnRaid };
+window.__sim = { S, Wx, update, render, N, CH, spawnRaid, setWeather };
 requestAnimationFrame(frame);
 </script>
 </body>

@@ -23,6 +23,9 @@ What happens on its own:
 - Old ants eventually die too. Workers carry the bodies up to a bare patch of
   earth on the right, where they slowly fade into the soil.
 - Day turns to night and back again.
+- The weather drifts slowly between sunny, cloudy, rain and thunderstorms with
+  lightning. When a thunderstorm comes, every ant hurries inside and stays there,
+  and no red ants come raiding until it passes.
 
 On phones and tablets the scene always draws in landscape: if the device is held
 upright, the picture is drawn sideways, so you just turn it. Tapping the screen
@@ -38,7 +41,8 @@ Download `index.html` and open it in any modern browser. There's nothing to
 install, no build step, and no network access needed.
 
 Add `?speed=N` to the URL to fast-forward the simulation (for example
-`index.html?speed=10`). Adding `?phone` shows the phone-sized creatures on
+`index.html?speed=10`). `?weather=storm` (or `sunny`, `cloudy`, `rain`)
+chooses the starting weather. Adding `?phone` shows the phone-sized creatures on
 a desktop.
 
 ## Deploy
