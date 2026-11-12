@@ -27,10 +27,35 @@
   #hint.rot{left:auto;right:0;top:50%;transform:translate(calc(50% - 36px),-50%) rotate(90deg);animation:none}
   @keyframes hint{0%,100%{transform:translateX(-50%) scale(1)}50%{transform:translateX(-50%) scale(1.07)}}
   @media (prefers-reduced-motion:reduce){#hint{animation:none}}
+  #dbgBtn{position:fixed;left:12px;top:12px;z-index:4;width:40px;height:40px;border-radius:50%;border:0;padding:0;cursor:pointer;
+    display:grid;place-items:center;color:#fff;background:rgba(20,14,10,.28);opacity:.6;transition:opacity .2s,background .2s}
+  #dbgBtn:hover,#dbgBtn[aria-expanded=true]{opacity:1;background:rgba(20,14,10,.6)}
+  #dbgBtn:focus-visible{outline:3px solid #ffd23f;outline-offset:2px}
+  #dbgBtn svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round}
+  #dbgBtn.rot{left:auto;right:12px}
+  #dbgBtn.rot svg{transform:rotate(90deg)}
+  #dbg{position:fixed;left:12px;top:60px;bottom:12px;width:330px;max-width:calc(100vw - 24px);z-index:3;overflow:auto;
+    background:rgba(18,12,8,.74);color:#f3ead8;border-radius:14px;padding:12px 14px 14px;box-sizing:border-box;
+    font:13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    box-shadow:0 8px 30px rgba(0,0,0,.35)}
+  #dbg[hidden]{display:none}
+  #dbg h2{margin:0 0 2px;font-size:15px;display:flex;justify-content:space-between;align-items:baseline}
+  #dbg h2 small{font-weight:400;opacity:.65;font-size:12px}
+  #dbg h3{margin:12px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#ffd27a;opacity:.9}
+  #dbg .row{display:grid;grid-template-columns:1fr auto;gap:0 8px;margin:5px 0}
+  #dbg .row output{font-variant-numeric:tabular-nums;color:#fff;opacity:.9}
+  #dbg input[type=range]{grid-column:1/-1;width:100%;margin:2px 0 0;accent-color:#ffb547}
+  #dbg .stats{display:grid;grid-template-columns:auto 1fr;gap:1px 10px;font-variant-numeric:tabular-nums;background:rgba(255,255,255,.06);border-radius:8px;padding:7px 9px;margin-top:6px}
+  #dbg .stats b{font-weight:500;opacity:.7}
+  #dbg .btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  #dbg button{font:inherit;border:0;border-radius:8px;padding:6px 10px;background:rgba(255,255,255,.14);color:inherit;cursor:pointer}
+  #dbg button:hover{background:rgba(255,255,255,.24)}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<button id="dbgBtn" type="button" aria-label="Debug settings" aria-expanded="false" title="Debug settings (D)"><svg viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
+<aside id="dbg" hidden aria-label="Debug settings"></aside>
 <button id="hint" type="button" hidden>♪ Click for music</button>
 <div id="ui">
   <button id="snd" type="button" aria-label="Sound on" title="Sound"></button>
@@ -45,6 +70,14 @@
 const W = 1600, H = 1000, SURF = 250, VIEW_TOP = 105, VIEW_W = 1300, VIEW_CX = 925;
 const params = new URLSearchParams(location.search);
 const SPEED = Math.max(0.1, Math.min(60, +params.get('speed') || 1));
+// Everything the debug panel (press D) can change. Defaults are the normal game.
+const TUNE_DEFAULTS = {
+  speed: SPEED, dayLen: 300, weatherLen: 1, weatherBlend: 1,
+  life: 660, popTarget: 26, broodSpeed: 1, meals: 3, walk: 1, snackEvery: 260,
+  foodRate: 1, raidEvery: 75, raidMax: 3, blackBite: 9, redBite: 22,
+  musicVol: 1, weatherVol: 1,
+};
+const TUNE = { ...TUNE_DEFAULTS };
 const COARSE = matchMedia('(pointer: coarse)').matches;
 const PHONE = params.has('phone') || (COARSE && Math.min(screen.width, screen.height) < 700);
 const AS = PHONE ? 2.35 : 1.75;      // ant drawing scale
@@ -274,6 +307,7 @@ function resize() {
   ROT = COARSE && h0 > w0;
   document.getElementById('ui').classList.toggle('rot', ROT);
   document.getElementById('hint').classList.toggle('rot', ROT);
+  document.getElementById('dbgBtn').classList.toggle('rot', ROT);
   cw = ROT ? h0 : w0; chh = ROT ? w0 : h0;
   cv.width = Math.round(w0 * dpr); cv.height = Math.round(h0 * dpr);
   scale = Math.min(chh / (H - VIEW_TOP), cw / VIEW_W);
@@ -463,7 +497,6 @@ function skyAt(p) {
   }
   return [hx(SKY[0][1]), hx(SKY[0][2])];
 }
-const DAY_LEN = 300;
 // ---- Weather -----------------------------------------------------------------
 // Sunny -> cloudy -> rain -> thunderstorm and back. Each state has target levels for
 // cloud cover, rain and storminess; the live levels drift towards them slowly, so
@@ -479,26 +512,27 @@ const WEATHER = {
 // watching shows every kind. Each entry is [weather, min seconds, max seconds].
 const CYCLE = [['sunny', 40, 60], ['cloudy', 20, 30], ['rain', 25, 35], ['storm', 35, 50], ['rain', 15, 25], ['cloudy', 15, 25]];
 const startIdx = Math.max(0, CYCLE.findIndex(c => c[0] === params.get('weather')));
-const Wx = { idx: startIdx, state: CYCLE[startIdx][0], left: rand(CYCLE[startIdx][1], CYCLE[startIdx][2]), cover: 0, rain: 0, storm: 0, wind: 0, drops: [], splashes: [], bolts: [], flash: 0, boltT: 3 };
+const Wx = { idx: startIdx, state: CYCLE[startIdx][0], left: rand(CYCLE[startIdx][1], CYCLE[startIdx][2]) * TUNE.weatherLen, cover: 0, rain: 0, storm: 0, wind: 0, drops: [], splashes: [], bolts: [], flash: 0, boltT: 3 };
 Object.assign(Wx, (({ cover, rain, storm }) => ({ cover, rain, storm }))(WEATHER[Wx.state]));
 const stormy = () => Wx.state === 'storm';
 function setWeather(st) { // jump to a weather (also used by tests)
   const i = CYCLE.findIndex(c => c[0] === st);
   DBG.event('weather', { from: Wx.state, to: st });
-  Wx.idx = i; Wx.state = st; Wx.left = rand(CYCLE[i][1], CYCLE[i][2]);
+  Wx.idx = i; Wx.state = st; Wx.left = rand(CYCLE[i][1], CYCLE[i][2]) * TUNE.weatherLen;
 }
 function nextWeather() {
   const i = (Wx.idx + 1) % CYCLE.length, [st, lo, hi] = CYCLE[i];
   DBG.event('weather', { from: Wx.state, to: st });
-  Wx.idx = i; Wx.state = st; Wx.left = rand(lo, hi);
+  Wx.idx = i; Wx.state = st; Wx.left = rand(lo, hi) * TUNE.weatherLen;
 }
 function updateWeather(dt) {
   Wx.left -= dt;
   if (Wx.left <= 0) nextWeather();
   const w = WEATHER[Wx.state], toward = (v, t, rate) => v + clamp(t - v, -rate * dt, rate * dt);
-  Wx.cover = toward(Wx.cover, w.cover, 1 / 14);
-  Wx.rain = toward(Wx.rain, w.rain, 1 / 12);
-  Wx.storm = toward(Wx.storm, w.storm, 1 / 12);
+  const bl = TUNE.weatherBlend;
+  Wx.cover = toward(Wx.cover, w.cover, bl / 14);
+  Wx.rain = toward(Wx.rain, w.rain, bl / 12);
+  Wx.storm = toward(Wx.storm, w.storm, bl / 12);
   Wx.wind = 30 + Wx.storm * 170;
   // raindrops fall through the sky and splash on the grass
   let n = Math.pow(Wx.rain, 1.5) * 900 * dt;
@@ -539,23 +573,23 @@ const BROOD_CAP = 18, STORE_CAP = 36, NEST_SLOTS = 10;
 // Population homeostasis. The colony aims for POP_TARGET ants and should stay
 // between POP_LOW and POP_HIGH. The queen looks ahead: every egg, larva and
 // cocoon on the way, plus the adults, minus the share of adults likely to die of
-// old age before those babies grow up (about half of them over the ~3 minutes
+// old age before those babies grow up (about a quarter of them over the ~3 minutes
 // it takes, measured in simulation). The
 // further that falls short of the target, the faster she lays; at or above it,
 // she stops. When the colony is small, larvae need one meal fewer. Brood grows faster when the colony is small and slows right down
 // when it's crowded. Old age only claims an ant while the colony is above POP_LOW.
-const POP_LOW = 20, POP_HIGH = 32, POP_TARGET = 26;
-function projectedPop() { return S.ants.length * 0.5 + S.brood.length; }
-const mealsNeeded = () => S.ants.length < POP_LOW ? 2 : 3;
+let POP_LOW = 20, POP_HIGH = 32, POP_TARGET = 26;
+function setPopTarget(t) { POP_TARGET = t; POP_LOW = Math.max(4, t - 6); POP_HIGH = t + 6; }
+function projectedPop() { return S.ants.length * (1 - clamp(170 / TUNE.life, 0.1, 0.7)) + S.brood.length; } // share expected to die while ~170 s of brood grows up
+const mealsNeeded = () => S.ants.length < POP_LOW ? Math.max(1, TUNE.meals - 1) : TUNE.meals;
 function broodPace() { // how fast babies develop: quicker when few ants, much slower when crowded
   const n = S.ants.length;
-  return n < POP_LOW ? 1.8 : n < POP_TARGET ? 1.2 : n <= POP_HIGH ? 1 : 0.35;
+  return TUNE.broodSpeed * (n < POP_LOW ? 1.8 : n < POP_TARGET ? 1.2 : n <= POP_HIGH ? 1 : 0.35);
 }
 const slotU = (nest, i) => CH[nest].s * (0.78 - i * 0.15);
 const QS = CH.Q.s;                           // queen's door side; she faces the door
 const qEggU = i => -QS * (0.9 - i * 0.075);  // egg pile at the far end, behind her
 const FOOD = { seed: '#d9b46a', berry: '#d23a4e', crumb: '#f2d27c', leaf: '#6dbb4a', blue: '#5566d6' };
-const BLACK_BITE = [7, 11], RED_BITE = [18, 26];
 const S = {
   t: 0, day: 0.08,
   ants: [], invaders: [], corpses: [], brood: [], parts: [], food: [],
@@ -572,15 +606,15 @@ class Ant {
   constructor(loc, age = 0, opts = {}) {
     this.id = uid++; this.loc = loc; const p = locPt(loc); this.x = p.x; this.y = p.y;
     this.path = []; this.f = Math.random() < .5 ? -1 : 1; this.tilt = 0; this.tiltT = 0;
-    this.ph = rand(0, 6); this.age = age; this.life = opts.life || rand(220, 440);
+    this.ph = rand(0, 6); this.age = age; this.life = opts.life || TUNE.life * rand(0.67, 1.33); // ~7-15 minutes by default
     this.job = null; this.carry = null; this.speed = (opts.speed || rand(70, 88)) * Math.sqrt(K);
     this.mode = null; this.target = null; this.hop = 0; this.anim = null; this.moving = false;
     this.red = !!opts.red; this.jit = 0; this.dir = { x: 1, y: 0 };
     this.hp = 100; this.biteT = rand(0.3, 1); this.lunge = 0; this.fighting = false; this.odo = 0;
-    this.hunger = rand(0, 0.8); this.hungerRate = 1 / rand(200, 320); this.want = null; // workers get peckish every few minutes
+    this.hunger = rand(0, 0.8); this.hungerK = rand(0.8, 1.25); this.want = null; // workers get peckish every few minutes
   }
   move(dt, mult = 1) {
-    let rem = this.speed * mult * dt * (this.carry ? 0.88 : 1) * (1 - 0.3 * (this.grey || 0));
+    let rem = this.speed * mult * TUNE.walk * dt * (this.carry ? 0.88 : 1) * (1 - 0.3 * (this.grey || 0));
     this.moving = this.path.length > 0;
     while (rem > 0 && this.path.length) {
       const t = this.path[0], dx = t.x - this.x, dy = t.y - this.y, d = Math.hypot(dx, dy);
@@ -591,7 +625,7 @@ class Ant {
     if (this.moving) this.ph += dt * this.speed * mult * 0.42 / Math.sqrt(K);
   }
   moveDirect(tx, ty, dt, mult) {
-    const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), s = Math.min(d, this.speed * mult * dt);
+    const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), s = Math.min(d, this.speed * mult * TUNE.walk * dt);
     if (d > 0.5) {
       this.x += dx / d * s; this.y += dy / d * s; this.odo += s;
       if (Math.abs(dx) > 0.25) this.f = dx > 0 ? 1 : -1; this.tiltT = Math.atan2(dy, Math.abs(dx));
@@ -815,7 +849,7 @@ function buryJob(a, c) {
       doo(() => { c.state = 'carried'; a.carry = { kind: 'corpse', c }; }),
       go(() => ({ node: 'E', sx: rand(1370, 1530) })),
       wait(0.5),
-      doo(() => { c.state = 'grave'; c.x = a.x + a.f * 24 * K; c.y = SURF - 5; c.decay = 0; a.carry = null; S.stats.buried++; if (c.red) S.stats.redBuried++; }),
+      doo(() => { c.state = 'grave'; c.x = a.x + a.f * 24 * K; c.y = SURF - 5; c.decay = 0; c.crossTilt = rand(-0.12, 0.12); a.carry = null; S.stats.buried++; if (c.red) S.stats.redBuried++; }),
     ], abort: () => { c.claimed = false; },
   };
 }
@@ -869,7 +903,7 @@ function updateQueen(dt) {
   if (q.layT <= 0) {
     const used = new Set(S.brood.filter(b => b.where === 'queen').map(b => b.slot));
     let slot = -1; for (let i = 0; i < 5; i++) if (!used.has(i)) { slot = i; break; }
-    const short = POP_TARGET - projectedPop(); // at the target that's ~13 adults' worth + ~13 brood
+    const short = POP_TARGET - projectedPop();
     // like real colonies: lay less when food is short, and never more babies than the workers can look after
     const fedEnough = storeTotal() >= 6, room = S.brood.length < Math.min(BROOD_CAP, Math.max(6, Math.round(S.ants.length * 0.6)));
     if (slot >= 0 && room && fedEnough && short > 0 && S.ants.length < POP_HIGH - 2) {
@@ -907,7 +941,7 @@ function updateFood(dt) {
   S.nextFood -= dt;
   const night = nightness(S.day);
   if (S.nextFood <= 0) {
-    S.nextFood = rand(2.5, 4.5) * (night > 0.5 ? 1.5 : 1) * (storeTotal() > 50 ? 2 : 1);
+    S.nextFood = rand(2.5, 4.5) * (night > 0.5 ? 1.5 : 1) * (storeTotal() > 50 ? 2 : 1) / TUNE.foodRate;
     if ((S.food.length < 7 || (S.food.length < 9 && wantedShort().size)) && !stormy()) {
       const lo = Math.max(60, visL + 50), hi = Math.min(1320, visR - 50);
       let x, tries = 0;
@@ -927,7 +961,7 @@ function updateFood(dt) {
 // carried to the graveyard like any other.
 function attackersOf(r) { return S.ants.filter(a => a.target === r); }
 function spawnRaid() {
-  const n = Math.random() < 0.55 ? 1 : Math.random() < 0.75 ? 2 : 3;
+  const n = Math.min(TUNE.raidMax, 1 + Math.floor(Math.pow(Math.random(), 1.8) * TUNE.raidMax)); // mostly 1, sometimes more
   const side = Math.random() < 0.5 ? -1 : 1;
   S.stats.raids++;
   DBG.event('raid', { n, side });
@@ -950,7 +984,7 @@ function updateRaids(dt) {
   S.nextRaid -= dt;
   if (S.nextRaid <= 0) {
     if (stormy()) S.nextRaid = rand(15, 30); // nobody raids in a storm
-    else { S.nextRaid = rand(50, 100); spawnRaid(); }
+    else { S.nextRaid = TUNE.raidEvery * rand(0.67, 1.33); spawnRaid(); }
   }
   for (const r of S.invaders.slice()) {
     if (stormy() && !r.fleeing) { // red ants run home from the storm
@@ -971,7 +1005,7 @@ function updateRaids(dt) {
       if (r.biteT <= 0) { // red bites one of the black ants
         r.biteT = rand(0.7, 1.0);
         const v = pick(fighters); r.face(v); r.lunge = 0.15;
-        v.hp -= rand(...RED_BITE); S.stats.bites++;
+        v.hp -= TUNE.redBite * rand(0.8, 1.2); S.stats.bites++;
         chomp((r.x + v.x) / 2, (r.y + v.y) / 2 - 8 * K);
         if (v.hp <= 25) retreat(v);
       }
@@ -1034,7 +1068,7 @@ function updateDefender(a, dt) {
     a.biteT -= dt;
     if (a.biteT <= 0 && a.tier < 2) { // the two closest on each side can bite
       a.biteT = rand(0.8, 1.2); a.lunge = 0.15;
-      r.hp -= rand(...BLACK_BITE); S.stats.bites++;
+      r.hp -= TUNE.blackBite * rand(0.8, 1.2); S.stats.bites++;
       chomp((r.x + a.x) / 2, (r.y + a.y) / 2 - 8 * K);
       if (r.hp <= 0) killRed(r);
     }
@@ -1055,7 +1089,7 @@ function updateAnts(dt) {
     if (!a.fighting && a.hp < 100) a.hp = Math.min(100, a.hp + dt * (a.mode ? 2 : 6));
     if (a.mode === 'defend') { updateDefender(a, dt); continue; }
     // an ant just loafing about notices hungry babies and goes to help
-    a.hunger += dt * a.hungerRate;
+    a.hunger += dt * a.hungerK / TUNE.snackEvery;
     if (a.hunger > 1 && !a.want) a.want = pickSnack(a);
     if (a.job && a.job.idle && Math.random() < dt * 0.7 && (hungryLarvae().length || a.hunger > 1.2)) { a.abort(); a.idleT = 0; }
     if (a.job) { a.runJob(dt); continue; }
@@ -1083,7 +1117,7 @@ function updateCorpses(dt) {
   }
 }
 function update(dt) {
-  S.t += dt; S.day = (S.day + dt / DAY_LEN) % 1;
+  S.t += dt; S.day = (S.day + dt / TUNE.dayLen) % 1;
   for (const c of clouds) { c.x += (c.v + Wx.storm * 25) * dt; if (c.x > visR + 200) c.x = visL - 260; }
   updateWeather(dt);
   if (stormy()) stormShelter();
@@ -1154,6 +1188,25 @@ function drawCarry(c, x, y) {
   if (c.kind === 'food') drawFoodBit(c.type, x + 2, y, 3.4 * Math.sqrt(K));
   else if (c.kind === 'egg') drawEgg(x + 3, y, 1);
   else if (c.kind === 'corpse') drawAnt(x + 9, y - 3, { f: 1, s: 0.8, col: c.c.red ? '#9a3020' : c.c.col || ANT_BLACK, dead: true, tilt: 0.25 });
+}
+function drawCross(x, y, tilt, alpha) { // a little wooden cross planted behind a grave
+  if (alpha <= 0.01) return;
+  const h = 30 * K, w = 16 * K, t = 3.4 * K;
+  g.save(); g.globalAlpha *= alpha; g.translate(x, y); g.rotate(tilt);
+  g.fillStyle = '#7a5434'; g.strokeStyle = 'rgba(50,30,15,0.6)'; g.lineWidth = 0.8 * K;
+  g.beginPath(); g.roundRect(-t / 2, -h, t, h, 1.2 * K); g.fill(); g.stroke();
+  g.beginPath(); g.roundRect(-w / 2, -h * 0.74 - t / 2, w, t, 1.2 * K); g.fill(); g.stroke();
+  g.fillStyle = 'rgba(255,230,190,0.25)'; g.fillRect(-t / 2 + 0.5, -h + 1, t * 0.35, h - 2); // light catching one edge
+  g.restore();
+}
+function foodPile(n) { // offsets (in piece radii) for a small mound, bottom row first
+  const out = [];
+  for (let row = 0, left = n; left > 0; row++) {
+    const k = Math.min(left, Math.max(1, 4 - row));
+    for (let i = 0; i < k; i++) out.push({ x: (i - (k - 1) / 2) * 1.7 + (Math.random() - 0.5) * 0.4, y: row * 1.25, rot: (Math.random() - 0.5) * 1.6 });
+    left -= k;
+  }
+  return out;
 }
 function drawFoodBit(type, x, y, r, rot = 0) {
   g.save(); g.translate(x, y); g.rotate(rot);
@@ -1328,6 +1381,7 @@ function render() {
     if (c.state === 'lying') drawAnt(c.x, c.y, { f: c.f, s: AS, col: base, dead: true });
     else {
       const d = c.decay;
+      drawCross(c.x, SURF + 2, c.crossTilt || 0, Math.max(0, 1 - d * d)); // fades away with the body
       drawAnt(c.x, c.y + d * 5, { f: c.f, s: AS * (1 - d * 0.35), col: mix(base, '#7a5a3c', Math.min(1, d * 1.3)), dead: true, alpha: Math.max(0, 1 - d * d) });
     }
   }
@@ -1349,9 +1403,13 @@ function render() {
     for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3 + S.t * 0.1; g.beginPath(); g.ellipse(tx + Math.cos(a) * 6, ty + Math.sin(a) * 6, 4.5, 3, a, 0, 7); g.fill(); }
     g.fillStyle = '#f2a516'; g.beginPath(); g.arc(tx, ty, 3.6, 0, 7); g.fill();
   }
-  for (const f of S.food) { // food lying in the meadow
-    const r = (6 + Math.sqrt(f.bites) * 5) * K, appear = Math.min(1, (S.t - f.born) * 2);
-    drawFoodBit(f.type, f.x, SURF - r * 0.7 * appear + 1, r * appear, f.rot);
+  for (const f of S.food) { // food lying in the meadow: a little pile, one piece per ant-load
+    if (!f.pile) f.pile = foodPile(f.max);
+    const r = 6.5 * K, appear = Math.min(1, (S.t - f.born) * 2.5);
+    for (let i = 0; i < f.bites && i < f.pile.length; i++) { // pieces leave from the top of the pile
+      const q = f.pile[i];
+      drawFoodBit(f.type, f.x + q.x * r, SURF - r * 0.65 + 1 - q.y * r * appear, r * appear, f.rot + q.rot);
+    }
   }
   for (const a of S.ants) antDraw(a);
   for (const r of S.invaders) antDraw(r);
@@ -1406,7 +1464,7 @@ function init() {
     const r = Math.random();
     const loc = r < 0.3 ? { node: pick(NESTS), u: rand(-0.7, 0.7) } : r < 0.5 ? (s => ({ node: s, u: storeDropU(s) }))(pick(STORES))
       : r < 0.62 ? { node: 'Q', u: QS * rand(0.45, 0.85) } : r < 0.88 ? { node: 'E', sx: rand(500, 1200) } : { node: pick(['A', 'B', 'C']) };
-    const life = rand(220, 440);
+    const life = TUNE.life * rand(0.67, 1.33);
     const a = new Ant(loc, rand(40, life - 30), { life }); a.idleT = rand(0, 2.5); S.ants.push(a);
   }
   for (const s of STORES) for (let i = 0; i < 10; i++) S.stores[s].push(pick(Object.keys(FOOD)));
@@ -1425,7 +1483,7 @@ function init() {
 // the person interacts with the page, so the first click/tap or key press turns
 // sound on; the speaker button mutes it for the rest of the visit.
 const SND = (() => {
-  let ctx = null, master = null, music = null, noise = null, on = false, rainG, rainLow, windG, windF, tone;
+  let ctx = null, master = null, music = null, wxBus = null, noise = null, on = false, rainG, rainLow, windG, windF, tone;
   let meter = null, dripAcc = 0, nextBar = 0, bar = 0, pass = 0, dark = 0, darkMode = false;
   let pref = 'on'; // every visit starts with sound wanted; muting lasts until the page is reloaded
   try { localStorage.removeItem('ants-sound'); } catch (e) { /* storage unavailable */ }
@@ -1435,6 +1493,7 @@ const SND = (() => {
     const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
     master = ctx.createGain(); master.gain.value = 0.9; master.connect(comp); comp.connect(ctx.destination);
     meter = ctx.createAnalyser(); meter.fftSize = 2048; comp.connect(meter);
+    wxBus = ctx.createGain(); wxBus.connect(master);
     tone = ctx.createBiquadFilter(); tone.type = 'lowpass'; tone.frequency.value = 3000; tone.Q.value = 0.5;
     music = ctx.createGain(); music.gain.value = 1.1; tone.connect(music); music.connect(master);
     const n = ctx.sampleRate * 3; noise = ctx.createBuffer(1, n, ctx.sampleRate); // 3 s of softened noise
@@ -1442,7 +1501,7 @@ const SND = (() => {
     for (let i = 0; i < n; i++) { const w = Math.random() * 2 - 1; b = 0.97 * b + 0.03 * w; d[i] = w * 0.55 + b * 3; }
     const loop = (lp, hp) => { const src = ctx.createBufferSource(); src.buffer = noise; src.loop = true; src.start(0, Math.random() * 2);
       const f1 = ctx.createBiquadFilter(); f1.type = 'highpass'; f1.frequency.value = hp; const f2 = ctx.createBiquadFilter(); f2.type = 'lowpass'; f2.frequency.value = lp;
-      const g = ctx.createGain(); g.gain.value = 0; src.connect(f1); f1.connect(f2); f2.connect(g); g.connect(master); return [g, f2]; };
+      const g = ctx.createGain(); g.gain.value = 0; src.connect(f1); f1.connect(f2); f2.connect(g); g.connect(wxBus); return [g, f2]; };
     [rainG] = loop(7000, 900); [rainLow] = loop(1400, 200); [windG, windF] = loop(500, 40);
     return true;
   }
@@ -1455,7 +1514,7 @@ const SND = (() => {
     updateButton();
   }
   const live = () => on && ctx && ctx.state === 'running' && !document.hidden;
-  function out(x, g, dest = master) {
+  function out(x, g, dest = wxBus) { // all the noisy sounds are weather (rain, drips, thunder)
     const p = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
     if (p) { p.pan.value = x == null ? 0 : clamp((x - (visL + visR) / 2) / ((visR - visL) / 2), -1, 1) * 0.75; g.connect(p); p.connect(dest); } else g.connect(dest);
   }
@@ -1512,7 +1571,8 @@ const SND = (() => {
     // music: darkness follows the weather; the tune switches key only at a bar line
     dark = clamp(rain * 0.9 + storm * 0.5, 0, 1);
     tone.frequency.setTargetAtTime(lerp(3200, 900, dark), now, 1.5);
-    music.gain.setTargetAtTime(lerp(1.1, 0.85, dark), now, 1.5);
+    music.gain.setTargetAtTime(lerp(1.1, 0.85, dark) * TUNE.musicVol, now, 0.3);
+    wxBus.gain.setTargetAtTime(TUNE.weatherVol, now, 0.3);
     if (nextBar < now) nextBar = now + 0.15;
     while (nextBar < now + 0.4) {
       if (!darkMode && dark > 0.35) darkMode = true; else if (darkMode && dark < 0.2) darkMode = false;
@@ -1578,12 +1638,93 @@ if (!COARSE && document.documentElement.requestFullscreen) {
   document.addEventListener('fullscreenchange', fsIcon); fsIcon();
 }
 
+// ---- Debug panel (press D) -----------------------------------------------------
+// A see-through panel of sliders for the game's main settings, live stats, and a
+// few buttons. Changes last until the page is reloaded.
+const fmtS = v => v >= 120 ? (v / 60).toFixed(v % 60 ? 1 : 0) + ' min' : Math.round(v) + ' s';
+const TUNE_SPEC = [
+  ['Time'],
+  { k: 'speed', label: 'Game speed', min: 0.25, max: 10, step: 0.25, fmt: v => v + '×' },
+  { k: 'dayLen', label: 'Day + night length', min: 60, max: 1200, step: 30, fmt: fmtS },
+  { k: 'weatherLen', label: 'Weather lasts', min: 0.25, max: 4, step: 0.25, fmt: v => v + '× (loop ≈ ' + fmtS(180 * v) + ')' },
+  { k: 'weatherBlend', label: 'Weather change speed', min: 0.25, max: 4, step: 0.25, fmt: v => v + '×' },
+  ['Colony'],
+  { k: 'popTarget', label: 'Target population', min: 8, max: 60, step: 1, fmt: v => v + ' (band ' + Math.max(4, v - 6) + '–' + (v + 6) + ')', apply: setPopTarget },
+  { k: 'life', label: 'Ant lifespan (average)', min: 120, max: 1800, step: 30, fmt: fmtS,
+    apply: (v, old) => { for (const a of S.ants) a.life *= v / old; } }, // existing ants age on the new scale
+  { k: 'broodSpeed', label: 'Babies grow', min: 0.25, max: 4, step: 0.25, fmt: v => v + '× speed' },
+  { k: 'meals', label: 'Meals a larva needs', min: 1, max: 6, step: 1, fmt: v => v },
+  { k: 'walk', label: 'Ant walking speed', min: 0.25, max: 3, step: 0.05, fmt: v => v.toFixed(2) + '×' },
+  { k: 'snackEvery', label: 'Workers get peckish every', min: 30, max: 900, step: 10, fmt: fmtS },
+  { k: 'foodRate', label: 'Food in the meadow', min: 0.25, max: 4, step: 0.25, fmt: v => v + '× as often' },
+  ['Red ants'],
+  { k: 'raidEvery', label: 'A raid about every', min: 15, max: 600, step: 5, fmt: fmtS },
+  { k: 'raidMax', label: 'Most red ants per raid', min: 1, max: 6, step: 1, fmt: v => v },
+  { k: 'blackBite', label: 'Black ant bite', min: 1, max: 50, step: 1, fmt: v => v + ' health' },
+  { k: 'redBite', label: 'Red ant bite', min: 1, max: 60, step: 1, fmt: v => v + ' health' },
+  ['Sound'],
+  { k: 'musicVol', label: 'Music volume', min: 0, max: 2, step: 0.05, fmt: v => Math.round(v * 100) + '%' },
+  { k: 'weatherVol', label: 'Rain & thunder volume', min: 0, max: 2, step: 0.05, fmt: v => Math.round(v * 100) + '%' },
+];
+const dbgEl = document.getElementById('dbg');
+function buildPanel() {
+  dbgEl.innerHTML = '<h2>Debug <small>press D to close</small></h2><div class="stats" id="dbgStats"></div>';
+  for (const it of TUNE_SPEC) {
+    if (Array.isArray(it)) { const h = document.createElement('h3'); h.textContent = it[0]; dbgEl.append(h); continue; }
+    const row = document.createElement('label'); row.className = 'row';
+    const name = document.createElement('span'); name.textContent = it.label;
+    const out = document.createElement('output');
+    const inp = document.createElement('input'); Object.assign(inp, { type: 'range', min: it.min, max: it.max, step: it.step, value: TUNE[it.k] });
+    const show = () => { out.textContent = it.fmt(TUNE[it.k]); };
+    inp.addEventListener('input', () => { const old = TUNE[it.k], v = +inp.value; TUNE[it.k] = v; if (it.apply) it.apply(v, old); show(); });
+    inp.addEventListener('change', () => DBG.event('tune', { [it.k]: TUNE[it.k] }));
+    it.input = inp; it.show = show; show();
+    row.append(name, out, inp); dbgEl.append(row);
+  }
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const btn = (txt, f) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = txt; b.addEventListener('click', f); btns.append(b); };
+  btn('Red ants now!', () => { if (!stormy()) spawnRaid(); });
+  btn('Next weather', () => nextWeather());
+  btn('Reset to defaults', () => {
+    for (const it of TUNE_SPEC) if (!Array.isArray(it)) { const old = TUNE[it.k]; TUNE[it.k] = TUNE_DEFAULTS[it.k]; if (it.apply) it.apply(TUNE[it.k], old); it.input.value = TUNE[it.k]; it.show(); }
+    DBG.event('tune reset');
+  });
+  btn('Close', () => toggleDebug(false));
+  dbgEl.append(btns);
+}
+function updateDebugStats() {
+  if (dbgEl.hidden) return;
+  const st = document.getElementById('dbgStats'); if (!st) return;
+  const n = S.ants.length, count = f => S.brood.filter(f).length;
+  const rows = [
+    ['Ants', `${n}  (aim ${POP_TARGET}, band ${POP_LOW}–${POP_HIGH})${n < POP_LOW ? ' ↓' : n > POP_HIGH ? ' ↑' : ''}`],
+    ['Babies', `${count(b => b.stage === 'egg')} eggs · ${count(b => b.stage === 'larva')} larvae · ${count(b => b.stage === 'pupa')} cocoons`],
+    ['Hungry', `${count(b => b.hungry)} larvae · ${S.ants.filter(a => a.hunger > 1).length} workers${S.queen.hunger > 1 ? ' · queen' : ''}`],
+    ['Food', `stores ${S.stores.F1.length} + ${S.stores.F2.length} · meadow ${S.food.reduce((t, f) => t + f.bites, 0)}`],
+    ['Red ants', `${S.invaders.length} here · next raid in ${stormy() ? 'after the storm' : fmtS(Math.max(0, S.nextRaid))}`],
+    ['Weather', `${Wx.state} · next change in ${fmtS(Math.max(0, Wx.left))}`],
+    ['Time', `${S.day < 0.52 ? 'day' : S.day < 0.68 ? 'dusk' : S.day < 0.9 ? 'night' : 'dawn'} · ${fmtS(S.t)} played`],
+    ['Totals', `${S.stats.born} born · ${S.stats.died} died · ${S.stats.redKilled} red beaten`],
+  ];
+  st.innerHTML = rows.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('');
+}
+function toggleDebug(show = dbgEl.hidden) {
+  if (show && !dbgEl.firstChild) buildPanel();
+  dbgEl.hidden = !show; document.getElementById('dbgBtn').setAttribute('aria-expanded', String(show)); updateDebugStats();
+}
+addEventListener('keydown', e => {
+  const k = e['key'];
+  if ((k === 'd' || k === 'D') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); toggleDebug(); }
+});
+document.getElementById('dbgBtn').addEventListener('click', () => toggleDebug());
+setInterval(updateDebugStats, 250);
+
 // ---- Main loop -----------------------------------------------------------
 let last = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
   const raw = now - last; last = now;
-  let dt = Math.min(0.1, raw / 1000) * SPEED;
+  let dt = Math.min(0.1, raw / 1000) * TUNE.speed;
   try {
     while (dt > 0) { const h = Math.min(dt, 1 / 30); update(h); dt -= h; }
     render();
@@ -1604,7 +1745,7 @@ function antInfo(a) {
 function debugState() {
   const count = (arr, f) => arr.filter(f).length, el = (performance.now() - MON.since) / 1000;
   return {
-    simT: Math.round(S.t), day: +S.day.toFixed(3), speed: SPEED,
+    simT: Math.round(S.t), day: +S.day.toFixed(3), speed: TUNE.speed, tuned: Object.fromEntries(Object.entries(TUNE).filter(([k, v]) => v !== TUNE_DEFAULTS[k])),
     weather: { state: Wx.state, left: Math.round(Wx.left), cover: +Wx.cover.toFixed(2), rain: +Wx.rain.toFixed(2), storm: +Wx.storm.toFixed(2) },
     ants: S.ants.length, projected: projectedPop(), outside: count(S.ants, onSurface), defending: count(S.ants, a => a.mode === 'defend'), invaders: S.invaders.length,
     brood: { eggsQ: count(S.brood, b => b.where === 'queen'), eggs: count(S.brood, b => b.where === 'nursery' && b.stage === 'egg'),

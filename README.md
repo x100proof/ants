@@ -35,7 +35,8 @@ What happens on its own:
   laying when food runs low.
 - Ants fade to a pale grey as they get very old.
 - Old ants eventually die too. Workers carry the bodies up to a bare patch of
-  earth on the right, where they slowly fade into the soil.
+  earth on the right, where each gets a little wooden cross. The body and its
+  cross slowly fade away together.
 - Day turns to night and back again.
 - The nest looks dug, not drawn with a ruler: tunnels wander and change width,
   chambers are lumpy with stones set into the walls, and roots poke through
@@ -90,6 +91,22 @@ server {
     index index.html;
 }
 ```
+
+## Debug panel
+
+Press **D**, or click the faint sliders button in the top-left corner, to open a
+see-through panel. It shows live stats (population and its
+target band, babies, hunger, food, raids, weather) and has sliders for the main
+settings:
+
+- game speed and the length of a day, the weather loop and weather changes
+- target population, ant lifespan, how fast babies grow, meals per larva,
+  walking speed, how often workers get peckish, how much food the meadow grows
+- how often red ants raid, the most per raid, and how hard each side bites
+- music and weather volume
+
+There are also buttons to send red ants now, skip to the next weather, and reset
+everything. Press D or click the button again to close it. Changes last until the page is reloaded.
 
 ## Debug log (optional)
 
