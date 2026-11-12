@@ -25,9 +25,21 @@ What happens on its own:
   black one, so it takes several black ants to beat one red ant. A badly bitten
   black ant goes home to rest and heal (the colony never loses an ant in a
   fight). A beaten red ant is carried to the graveyard.
+- Every few minutes a worker gets peckish. A thought bubble shows the food it
+  fancies, and it fetches one from the meadow or a store and eats it. Workers
+  leave a store's last few of any food for the babies.
+- The colony keeps itself at a healthy size, roughly 20–32 ants. The queen lays
+  faster when numbers drop (allowing for the babies already on the way), stops
+  when there are enough, and babies grow up quicker in a small colony and much
+  more slowly in a crowded one. Like a real colony, the queen also holds off
+  laying when food runs low.
+- Ants fade to a pale grey as they get very old.
 - Old ants eventually die too. Workers carry the bodies up to a bare patch of
   earth on the right, where they slowly fade into the soil.
 - Day turns to night and back again.
+- The nest looks dug, not drawn with a ruler: tunnels wander and change width,
+  chambers are lumpy with stones set into the walls, and roots poke through
+  the ceilings. It's all generated vector shapes, the same layout every visit.
 - The weather drifts slowly between sunny, cloudy, rain and thunderstorms with
   lightning. When a thunderstorm comes, every ant hurries inside and stays there,
   and no red ants come raiding until it passes.
@@ -38,7 +50,8 @@ Browsers only allow sound after you interact with the page, so the first click o
 tap anywhere (or a key press) starts it, and a "Click for music" button
 invites that. The speaker button in the corner mutes and unmutes for the rest
 of the visit. All of it is synthesised in the browser, so there are
-no audio files. On a PC there's also a full-screen button.
+no audio files. On a PC there's also a full-screen button, and while the game is full screen it
+asks the browser to keep the screen awake.
 
 On phones and tablets the scene always draws in landscape: if the device is held
 upright, the picture is drawn sideways, so you just turn it. Tapping the screen

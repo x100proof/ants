@@ -131,6 +131,7 @@ const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 function hx(c) { return [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)); }
+function hexOf(c) { if (c[0] === '#') return c; const m = c.match(/\d+/g); return '#' + m.slice(0, 3).map(v => (+v).toString(16).padStart(2, '0')).join(''); }
 function mix(a, b, t) { const A = hx(a), B = hx(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(',')})`; }
 const mixA = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
 const rgb = (a, al = 1) => `rgba(${a.map(Math.round).join(',')},${al})`;
@@ -148,10 +149,29 @@ const CH = {
 };
 for (const k in CH) CH[k].s = Math.sign(CH[k].door);
 const STORES = ['F1', 'F2'], NESTS = ['N1', 'N2'];
-function floorPt(ch, u, lift = 0) {
-  return { x: ch.cx + u * ch.rx, y: ch.cy + ch.ry * Math.sqrt(Math.max(0, 1 - u * u)) - lift };
+// Chambers are lumpy ovals: the outline radius wobbles with a few smooth bumps
+// (bigger on the walls and ceiling, gentle on the floor, so things can rest on it).
+// Ants walk along the floor, the lower half of the outline.
+const LR = mulberry(2024);
+for (const k in CH) {
+  const c = CH[k];
+  c.wob = [2, 3, 4, 5, 7].map(j => ({ j, a: (0.6 + LR() * 0.8) / j, ph: LR() * 6.283 }));
 }
-function floorY(ch, x) { const u = (x - ch.cx) / ch.rx; return ch.cy + ch.ry * Math.sqrt(Math.max(0, 1 - u * u)); }
+function lump(ch, th, floorAmp = 0.025, wallAmp = 0.11) { // radius scale at angle th (y down: floor is 0..PI)
+  let n = 0; for (const w of ch.wob) n += w.a * Math.sin(w.j * th + w.ph);
+  const floorness = Math.max(0, Math.sin(th)), amp = lerp(wallAmp, floorAmp, Math.pow(floorness, 0.6));
+  return 1 + n * amp;
+}
+function floorPt(ch, u, lift = 0) {
+  const th = Math.acos(clamp(u, -1, 1)), sc = lump(ch, th);
+  return { x: ch.cx + u * ch.rx * sc, y: ch.cy + ch.ry * Math.sin(th) * sc - lift };
+}
+function floorY(ch, x) { return floorPt(ch, (x - ch.cx) / ch.rx).y; }
+function chamberOutline(ch, pad, steps = 140) { // closed polygon, padded outward
+  const pts = [];
+  for (let i = 0; i < steps; i++) { const th = i / steps * Math.PI * 2, sc = lump(ch, th); pts.push([ch.cx + Math.cos(th) * (ch.rx * sc + pad), ch.cy + Math.sin(th) * (ch.ry * sc + pad)]); }
+  return pts;
+}
 const N = { E: { x: 800, y: SURF - LIFT }, A: { x: 812, y: 345 }, B: { x: 838, y: 560 }, C: { x: 792, y: 770 } };
 for (const k in CH) N[k] = floorPt(CH[k], CH[k].door, LIFT);
 const EDGES = [['E', 'A'], ['A', 'F1'], ['A', 'F2'], ['A', 'B'], ['B', 'N1'], ['B', 'N2'], ['B', 'C'], ['C', 'Q']];
@@ -162,9 +182,28 @@ function route(a, b) {
   while (q.length) { const n = q.shift(); if (n === b) break; for (const m of ADJ[n]) if (!(m in prev)) { prev[m] = n; q.push(m); } }
   const r = []; for (let n = b; n != null; n = prev[n]) r.unshift(n); return r;
 }
-// A "loc" is where an ant can stand: {node:'F1',u} on a chamber floor, {node:'E',sx} on
-// the surface, or {node:'A'} at a tunnel bend.
+// Tunnels wander: each one is a smooth curve between its two end points, pushed
+// sideways by two gentle waves (fading out at the ends so they still meet the
+// junctions), then sampled every ~10 units. The same samples are drawn and walked.
+const TUNNEL = {}, EDGE_OF = {};
+for (const [a, b] of EDGES) {
+  const key = a + '-' + b, A = N[a], B = N[b], dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy);
+  const nx = -dy / len, ny = dx / len, amp = clamp(len * 0.11, 8, 30);
+  const w1 = { f: 0.8 + LR() * 0.6, p: LR() * 6.283 }, w2 = { f: 1.8 + LR() * 0.9, p: LR() * 6.283 }, bias = (LR() - 0.5) * 0.8;
+  const n = Math.max(4, Math.round(len / 10)), pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, env = Math.pow(Math.sin(Math.PI * t), 0.8);
+    const off = amp * env * (0.65 * Math.sin(6.283 * w1.f * t + w1.p) + 0.35 * Math.sin(6.283 * w2.f * t + w2.p) + bias);
+    pts.push({ x: A.x + dx * t + nx * off, y: A.y + dy * t + ny * off, t });
+  }
+  pts[0] = { ...A, t: 0 }; pts[n] = { ...B, t: 1 };
+  TUNNEL[key] = { a, b, pts, wid: [LR() * 6.283, LR() * 6.283] };
+  EDGE_OF[a + '|' + b] = key; EDGE_OF[b + '|' + a] = key;
+}
+// A "loc" is where an ant can stand: {node:'F1',u} on a chamber floor, {node:'E',sx}
+// on the surface, {node:'A'} at a tunnel junction, or {via:'A-B',k} part-way along a tunnel.
 function locPt(loc) {
+  if (loc.via) { const p = TUNNEL[loc.via].pts[loc.k]; return { x: p.x, y: p.y }; }
   if (loc.u != null) return floorPt(CH[loc.node], loc.u, LIFT);
   if (loc.sx != null) return { x: loc.sx, y: SURF - LIFT };
   return N[loc.node];
@@ -176,19 +215,42 @@ function floorSeg(id, u0, u1) {
   for (let i = 1; i <= n; i++) pts.push(P({ node: id, u: lerp(u0, u1, i / n) }));
   return pts;
 }
-function buildPath(loc, dest) {
-  const pts = [P(loc)];
-  if (loc.node === dest.node) {
-    if (CH[loc.node]) return pts.concat(floorSeg(loc.node, loc.u, dest.u));
-    pts.push(P(dest)); return pts;
+function walkEdge(key, k0, k1) { // points after index k0 up to k1 along a tunnel
+  const T = TUNNEL[key], last = T.pts.length - 1, out = [], dir = k1 > k0 ? 1 : -1;
+  for (let k = k0 + dir; dir > 0 ? k <= k1 : k >= k1; k += dir) {
+    if (k === 0) out.push(P(nodeLoc(T.a))); else if (k === last) out.push(P(nodeLoc(T.b))); else out.push(P({ via: key, k }));
   }
-  if (CH[loc.node]) pts.push(...floorSeg(loc.node, loc.u, CH[loc.node].door));
-  else if (loc.node === 'E') pts.push(P(nodeLoc('E')));
-  const r = route(loc.node, dest.node);
-  for (let i = 1; i < r.length; i++) pts.push(P(nodeLoc(r[i])));
-  if (CH[dest.node]) pts.push(...floorSeg(dest.node, CH[dest.node].door, dest.u));
-  else if (dest.node === 'E') pts.push(P(dest));
-  return pts;
+  return out;
+}
+const endIdx = (key, node) => TUNNEL[key].a === node ? 0 : TUNNEL[key].pts.length - 1;
+function nodeRoute(from, to) { // points walking the tunnels from one junction/door to another
+  const r = route(from, to), out = [];
+  for (let i = 1; i < r.length; i++) { const key = EDGE_OF[r[i - 1] + '|' + r[i]]; out.push(...walkEdge(key, endIdx(key, r[i - 1]), endIdx(key, r[i]))); }
+  return out;
+}
+function pathLen(pts) { let L = 0; for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y); return L; }
+function buildPath(loc, dest) {
+  const here = P(loc);
+  // same tunnel: just walk along it
+  if (loc.via && dest.via === loc.via) return [here, ...walkEdge(loc.via, loc.k, dest.k)];
+  // same chamber / surface / junction (and not part-way along a tunnel)
+  if (!loc.via && !dest.via && loc.node === dest.node) {
+    if (CH[loc.node]) return [here, ...floorSeg(loc.node, loc.u, dest.u)];
+    return [here, P(dest)];
+  }
+  // ways out of where we are, and ways into where we're going (two each if part-way along a tunnel)
+  const starts = loc.via
+    ? [TUNNEL[loc.via].a, TUNNEL[loc.via].b].map(n => ({ node: n, pts: walkEdge(loc.via, loc.k, endIdx(loc.via, n)) }))
+    : [{ node: loc.node, pts: CH[loc.node] ? floorSeg(loc.node, loc.u, CH[loc.node].door) : loc.node === 'E' && loc.sx !== N.E.x ? [P(nodeLoc('E'))] : [] }];
+  const ends = dest.via
+    ? [TUNNEL[dest.via].a, TUNNEL[dest.via].b].map(n => ({ node: n, pts: walkEdge(dest.via, endIdx(dest.via, n), dest.k) }))
+    : [{ node: dest.node, pts: CH[dest.node] ? floorSeg(dest.node, CH[dest.node].door, dest.u) : dest.node === 'E' ? [P(dest)] : [] }];
+  let best = null, bestLen = Infinity;
+  for (const s of starts) for (const e of ends) {
+    const pts = [here, ...s.pts, ...nodeRoute(s.node, e.node), ...e.pts], L = pathLen(pts);
+    if (L < bestLen) { bestLen = L; best = pts; }
+  }
+  return best;
 }
 
 // ---- Canvas / view -------------------------------------------------------
@@ -249,23 +311,108 @@ function buildBg() {
     b.fillStyle = `rgba(${c + 20},${c},${c - 15},${0.35 + R() * 0.4})`;
     b.beginPath(); b.ellipse(x, y, r * 1.3, r, R() * 3, 0, 7); b.fill();
   }
-  const TW = 44 * K; // tunnel width
-  const carve = (w, col) => {
-    b.strokeStyle = col; b.fillStyle = col; b.lineWidth = w;
-    for (const [p, q] of EDGES) {
-      const a = N[p], c = N[q];
-      b.beginPath(); b.moveTo(a.x, a.y + 4); b.lineTo(c.x, c.y + 4); b.stroke();
-    }
-    const pad = (w - TW) / 2;
-    for (const k in CH) { const c = CH[k]; b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 14 + pad, c.ry + 14 + pad, 0, 0, 7); b.fill(); }
+  // ---- carve the colony: lumpy chambers + wandering tunnels of uneven width ----
+  const TW = 44 * K, R2 = mulberry(99);
+  const intoRoom = (pts, end) => { // carry a tunnel on into its chamber so the doorway blends in
+    const id = end ? pts.at(-1).id : pts[0].id; if (!CH[id]) return [];
+    const c = CH[id], d = end ? pts.at(-1) : pts[0], tx = c.cx - d.x, ty = c.cy + c.ry * 0.25 - d.y, L2 = Math.hypot(tx, ty);
+    return [1, 2, 3].map(i => ({ x: d.x + tx / L2 * i * 14, y: d.y + ty / L2 * i * 14, t: end ? 1 : 0 }));
   };
-  carve(TW + 12, '#5c3a22'); carve(TW, '#2e1e13');
-  for (const k in CH) { // warm glow + floor rim
+  const tunnelPoly = (T, extra) => { // outline polygon around a tunnel's centre line
+    const base = T.pts.map((q, i) => ({ ...q, id: i === 0 ? T.a : i === T.pts.length - 1 ? T.b : null }));
+    const pts = [...intoRoom(base, false).reverse(), ...base, ...intoRoom(base, true)], L = [], Rt = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p0 = pts[Math.max(0, i - 1)], p1 = pts[Math.min(pts.length - 1, i + 1)], dx = p1.x - p0.x, dy = p1.y - p0.y, d = Math.hypot(dx, dy) || 1;
+      const t = pts[i].t, hw = TW / 2 * Math.max(0.86, 1 + 0.15 * Math.sin(t * 10.7 + T.wid[0]) + 0.07 * Math.sin(t * 27 + T.wid[1])) + extra;
+      const nx = -dy / d, ny = dx / d, cx = pts[i].x, cy = pts[i].y + 4;
+      L.push([cx + nx * hw, cy + ny * hw]); Rt.push([cx - nx * hw, cy - ny * hw]);
+    }
+    const ends = [[T.a, pts[0]], [T.b, pts.at(-1)]].filter(([id]) => !CH[id]).map(([, q]) => [q.x, q.y + 4]); // round ends only at junctions
+    return { poly: L.concat(Rt.reverse()), ends, r: TW / 2 + extra };
+  };
+  const cave = extra => { // the whole hollow as one path (sub-paths overlap; filled non-zero)
+    const path = new Path2D(), poly = pts => {
+      // every outline must wind the same way as arc() (positive area), or overlaps cancel out under non-zero fill
+      let area = 0; for (let i = 0; i < pts.length; i++) { const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length]; area += x1 * y2 - x2 * y1; }
+      if (area < 0) pts = pts.slice().reverse();
+      path.moveTo(pts[0][0], pts[0][1]); for (const q of pts) path.lineTo(q[0], q[1]); path.closePath();
+    };
+    for (const k in TUNNEL) { const t = tunnelPoly(TUNNEL[k], extra); poly(t.poly); for (const [x, y] of t.ends) { path.moveTo(x + t.r, y); path.arc(x, y, t.r, 0, 6.283); } }
+    for (const k in CH) poly(chamberOutline(CH[k], 14 + extra));
+    return path;
+  };
+  const rim = cave(7), hollow = cave(0);
+  b.fillStyle = '#5c3a22'; b.fill(rim);
+  b.fillStyle = '#2e1e13'; b.fill(hollow);
+  b.save(); b.clip(hollow);
+  for (const k in CH) { // warm glow in each chamber
     const c = CH[k], rg = b.createRadialGradient(c.cx, c.cy + 20, 10, c.cx, c.cy, c.rx + 20);
-    rg.addColorStop(0, 'rgba(255,190,110,0.16)'); rg.addColorStop(1, 'rgba(255,190,110,0)');
-    b.fillStyle = rg; b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 14, c.ry + 14, 0, 0, 7); b.fill();
-    b.strokeStyle = 'rgba(120,80,50,0.5)'; b.lineWidth = 3;
-    b.beginPath(); b.ellipse(c.cx, c.cy, c.rx + 12, c.ry + 12, 0, 0.15, Math.PI - 0.15); b.stroke();
+    rg.addColorStop(0, 'rgba(255,190,110,0.17)'); rg.addColorStop(1, 'rgba(255,190,110,0)');
+    b.fillStyle = rg; b.fillRect(c.cx - c.rx - 40, c.cy - c.ry - 40, c.rx * 2 + 80, c.ry * 2 + 80);
+  }
+  for (const k in CH) { // packed, lighter earth along each floor
+    const c = CH[k]; b.strokeStyle = 'rgba(150,104,66,0.28)'; b.lineWidth = 9; b.lineCap = 'round'; b.beginPath();
+    for (let u = -0.93; u <= 0.93; u += 0.02) { const q = floorPt(c, u, -12); u === -0.93 ? b.moveTo(q.x, q.y) : b.lineTo(q.x, q.y); }
+    b.stroke();
+  }
+  for (let i = 0; i < 900; i++) { // soil speckle on the walls of the hollow
+    const x = L + R2() * (Rr - L), y = SURF + R2() * (B - SURF), r = 0.6 + R2() * 1.6;
+    b.fillStyle = R2() < 0.5 ? 'rgba(90,60,38,0.55)' : 'rgba(20,12,7,0.5)'; b.beginPath(); b.arc(x, y, r, 0, 6.283); b.fill();
+  }
+  b.restore();
+  // inner shadow: the dirt around the hollow casts a soft shadow just inside its edge
+  const sh = document.createElement('canvas'); sh.width = bg.width; sh.height = bg.height;
+  const sc = sh.getContext('2d'); sc.fillStyle = '#000'; sc.fillRect(0, 0, sh.width, sh.height);
+  worldT(sc); sc.globalCompositeOperation = 'destination-out'; sc.fill(hollow);
+  b.save(); b.clip(hollow); b.setTransform(1, 0, 0, 1, 0, 0);
+  b.shadowColor = 'rgba(8,4,2,0.75)'; b.shadowBlur = 16 * dpr * scale; b.shadowOffsetY = 6 * dpr * scale;
+  b.drawImage(sh, 0, 0); b.restore(); worldT(b);
+  // stones set into the walls, half in the dirt and half poking into the hollow
+  const stone = (x, y, r, rot) => {
+    const n = 7, pts = [];
+    for (let i = 0; i < n; i++) { const a = rot + i / n * 6.283, rr = r * (0.78 + R2() * 0.36); pts.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr * 0.82]); }
+    const shade = 120 + R2() * 50 | 0, tint = R2() * 18 | 0;
+    const g2 = b.createLinearGradient(x - r, y - r, x + r * 0.6, y + r);
+    g2.addColorStop(0, `rgb(${shade + 35},${shade + 28 - tint},${shade + 18 - tint})`); g2.addColorStop(1, `rgb(${shade - 40},${shade - 46 - tint},${shade - 52 - tint})`);
+    b.beginPath();
+    for (let i = 0; i < n; i++) { const p0 = pts[i], p1 = pts[(i + 1) % n], mx = (p0[0] + p1[0]) / 2, my = (p0[1] + p1[1]) / 2; i ? b.quadraticCurveTo(p0[0], p0[1], mx, my) : b.moveTo(mx, my); }
+    b.quadraticCurveTo(pts[0][0], pts[0][1], (pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2); b.closePath();
+    b.save(); b.shadowColor = 'rgba(10,5,2,0.45)'; b.shadowBlur = 5 * dpr * scale; b.shadowOffsetY = 2 * dpr * scale;
+    b.fillStyle = g2; b.fill(); b.restore();
+    b.strokeStyle = 'rgba(40,24,14,0.55)'; b.lineWidth = 1.1; b.stroke();
+    b.fillStyle = 'rgba(255,245,225,0.22)'; b.beginPath(); b.ellipse(x - r * 0.3, y - r * 0.35, r * 0.42, r * 0.22, -0.4, 0, 6.283); b.fill();
+    if (R2() < 0.35) { b.strokeStyle = 'rgba(40,24,14,0.4)'; b.lineWidth = 0.8; b.beginPath(); b.moveTo(x - r * 0.2, y - r * 0.6); b.lineTo(x + r * 0.05, y - r * 0.05); b.lineTo(x - r * 0.1, y + r * 0.4); b.stroke(); }
+  };
+  for (const k in CH) {
+    const c = CH[k], doorTh = Math.acos(c.door);
+    for (let i = 0; i < 8; i++) {
+      // mostly ceiling and upper walls; a couple low on the sides; never in the doorway or mid-floor
+      let th = R2() < 0.75 ? Math.PI + R2() * Math.PI : (R2() < 0.5 ? R2() * 0.5 : Math.PI - R2() * 0.5);
+      if (Math.abs(((th - doorTh + 9.42) % 6.283) - 3.14) < 0.45) continue;
+      const sc2 = lump(c, th), pad = 12 + R2() * 6;
+      stone(c.cx + Math.cos(th) * (c.rx * sc2 + pad), c.cy + Math.sin(th) * (c.ry * sc2 + pad), (6 + R2() * 9) * Math.sqrt(K), R2() * 6);
+    }
+  }
+  for (const k in TUNNEL) { // a few along the tunnel walls
+    const T = TUNNEL[k]; if (T.a === 'E') continue;
+    for (let i = 0; i < 2; i++) {
+      const j = 2 + (R2() * (T.pts.length - 4) | 0), p0 = T.pts[j - 1], p1 = T.pts[j + 1], d = Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1;
+      const side = R2() < 0.5 ? -1 : 1, off = (TW / 2 + 3) * side;
+      stone(T.pts[j].x - (p1.y - p0.y) / d * off, T.pts[j].y + 4 + (p1.x - p0.x) / d * off, (4 + R2() * 5) * Math.sqrt(K), R2() * 6);
+    }
+  }
+  for (const k of ['F1', 'F2']) { // roots dangling through the ceilings of the upper chambers
+    const c = CH[k];
+    for (let i = 0; i < 3; i++) {
+      let x = c.cx + (R2() - 0.5) * c.rx * 1.2, y = c.cy - c.ry - 60; const end = c.cy - c.ry * (0.35 + R2() * 0.35);
+      const pts = [[x, y]]; while (y < end) { y += 7; x += (R2() - 0.5) * 7; pts.push([x, y]); }
+      for (const [w, col] of [[3.2, 'rgba(120,88,52,0.9)'], [1.6, 'rgba(214,184,134,0.95)']]) {
+        b.strokeStyle = col; b.lineWidth = w; b.lineCap = 'round'; b.lineJoin = 'round'; b.beginPath();
+        pts.forEach(([px, py], j) => j ? b.lineTo(px, py) : b.moveTo(px, py)); b.stroke();
+      }
+      const [tx, ty] = pts[pts.length - 1]; b.strokeStyle = 'rgba(214,184,134,0.8)'; b.lineWidth = 0.9; // root hairs
+      for (let h = 0; h < 3; h++) { b.beginPath(); b.moveTo(tx, ty - h * 6); b.lineTo(tx + (R2() - 0.5) * 12, ty - h * 6 + 4 + R2() * 5); b.stroke(); }
+    }
   }
   // top-soil band, graveyard patch, anthill mound
   b.fillStyle = '#6b4a2a'; b.fillRect(L, SURF - 1, Rr - L, 9);
@@ -384,7 +531,22 @@ function nightness(p) { // 0 = full day, 1 = full night
 }
 
 // ---- Simulation state ----------------------------------------------------
-const POP_CAP = 40, BROOD_CAP = 18, STORE_CAP = 36, NEST_SLOTS = 10;
+const BROOD_CAP = 18, STORE_CAP = 36, NEST_SLOTS = 10;
+// Population homeostasis. The colony aims for POP_TARGET ants and should stay
+// between POP_LOW and POP_HIGH. The queen looks ahead: every egg, larva and
+// cocoon on the way, plus the adults, minus the share of adults likely to die of
+// old age before those babies grow up (about half of them over the ~3 minutes
+// it takes, measured in simulation). The
+// further that falls short of the target, the faster she lays; at or above it,
+// she stops. When the colony is small, larvae need one meal fewer. Brood grows faster when the colony is small and slows right down
+// when it's crowded. Old age only claims an ant while the colony is above POP_LOW.
+const POP_LOW = 20, POP_HIGH = 32, POP_TARGET = 26;
+function projectedPop() { return S.ants.length * 0.5 + S.brood.length; }
+const mealsNeeded = () => S.ants.length < POP_LOW ? 2 : 3;
+function broodPace() { // how fast babies develop: quicker when few ants, much slower when crowded
+  const n = S.ants.length;
+  return n < POP_LOW ? 1.8 : n < POP_TARGET ? 1.2 : n <= POP_HIGH ? 1 : 0.35;
+}
 const slotU = (nest, i) => CH[nest].s * (0.78 - i * 0.15);
 const QS = CH.Q.s;                           // queen's door side; she faces the door
 const qEggU = i => -QS * (0.9 - i * 0.075);  // egg pile at the far end, behind her
@@ -411,9 +573,10 @@ class Ant {
     this.mode = null; this.target = null; this.hop = 0; this.anim = null; this.moving = false;
     this.red = !!opts.red; this.jit = 0; this.dir = { x: 1, y: 0 };
     this.hp = 100; this.biteT = rand(0.3, 1); this.lunge = 0; this.fighting = false; this.odo = 0;
+    this.hunger = rand(0, 0.8); this.hungerRate = 1 / rand(200, 320); this.want = null; // workers get peckish every few minutes
   }
   move(dt, mult = 1) {
-    let rem = this.speed * mult * dt * (this.carry ? 0.88 : 1);
+    let rem = this.speed * mult * dt * (this.carry ? 0.88 : 1) * (1 - 0.3 * (this.grey || 0));
     this.moving = this.path.length > 0;
     while (rem > 0 && this.path.length) {
       const t = this.path[0], dx = t.x - this.x, dy = t.y - this.y, d = Math.hypot(dx, dy);
@@ -491,6 +654,35 @@ function wantedShort() { // foods a hungry creature wants that no store has
 }
 const nestOf = loc => (loc && NESTS.includes(loc.node)) ? loc.node : pick(NESTS);
 
+// Every few minutes a worker gets peckish: a thought bubble shows the food it
+// fancies, and it fetches one from the meadow or a store and eats it.
+const spare = t => S.stores.F1.filter(x => x === t).length + S.stores.F2.filter(x => x === t).length >= 4; // leave the last few for the babies
+function pickSnack(a) {
+  const opts = FOOD_TYPES.filter(t => spare(t) || (!stormy() && S.food.some(f => f.type === t && f.bites - f.claims > 0)));
+  return opts.length ? pick(opts) : null;
+}
+function eatJob(a) {
+  const want = a.want, ground = stormy() ? [] : S.food.filter(f => f.type === want && f.bites - f.claims > 0);
+  const store = spare(want) ? takeStoreFor(nestOf(a.loc) === 'N2' ? 'N2' : 'N1', want) : null;
+  const outside = onSurface(a) || (a.loc.node === 'E');
+  const useGround = ground.length && (!store || outside || Math.random() < 0.4);
+  const done = () => { a.hunger = 0; a.want = null; a.carry = null; S.stats.snacks = (S.stats.snacks || 0) + 1; hearts(a.x, a.y - 16 * K, 2); };
+  if (useGround) {
+    const item = ground.sort((p, q) => Math.abs(p.x - a.x) - Math.abs(q.x - a.x))[0];
+    item.claims++; let rel = false; const release = () => { if (!rel) { rel = true; item.claims--; } };
+    return { steps: [
+      go(() => ({ node: 'E', sx: item.x + rand(-4, 4) })),
+      doo(() => { release(); if (item.bites <= 0) return false; item.bites--; if (item.bites <= 0) S.food.splice(S.food.indexOf(item), 1); a.carry = { kind: 'food', type: want }; }),
+      wait(2, 'feed'), doo(done),
+    ], abort: () => { release(); a.carry = null; } };
+  }
+  if (!store) { a.want = null; return null; }
+  return { steps: [
+    go(() => ({ node: store, u: storeTakeU(store) })),
+    doo(() => { const t = takeFrom(store, want); if (t == null) { a.want = null; return false; } a.carry = { kind: 'food', type: t }; }),
+    wait(2, 'feed'), doo(done),
+  ], abort: () => { a.carry = null; } };
+}
 function idleJob(a) {
   const r = Math.random(); let dest, anim = 'groom';
   if (a.age < 30 || r < 0.35) { const n = pick(NESTS); dest = { node: n, u: rand(-0.75, 0.75) }; anim = 'tend'; }
@@ -624,6 +816,7 @@ function buryJob(a, c) {
   };
 }
 
+const hungryLarvae = () => S.brood.filter(b => b.stage === 'larva' && b.where === 'nursery' && b.hungry && !b.claimed && stocked(b.want));
 function chooseJob(a) {
   const q = S.queen, grown = a.age > 35;
   const corpse = S.corpses.find(c => c.state === 'lying' && !c.claimed);
@@ -631,8 +824,12 @@ function chooseJob(a) {
   const egg = S.brood.find(b => b.where === 'queen' && !b.claimed);
   if (egg && Math.random() < 0.75 && freeSlot()) return eggJob(a, egg);
   if (q.hunger > 1 && !q.claimed && stocked(q.want) && Math.random() < 0.8) return feedQueenJob(a);
-  const hungry = S.brood.filter(b => b.stage === 'larva' && b.where === 'nursery' && b.hungry && !b.claimed && stocked(b.want));
-  if (hungry.length && Math.random() < 0.8) {
+  if (a.hunger > 1) { // peckish: have a snack (very hungry: before anything else)
+    if (!a.want) a.want = pickSnack(a);
+    if (a.want && (a.hunger > 1.2 || Math.random() < 0.85)) { const j = eatJob(a); if (j) return j; }
+  }
+  const hungry = hungryLarvae();
+  if (hungry.length && Math.random() < 0.95) { // babies first
     const near = hungry.filter(b => b.nest === nestOf(a.loc));
     return feedLarvaJob(a, pick(near.length ? near : hungry));
   }
@@ -640,7 +837,7 @@ function chooseJob(a) {
     const short = wantedShort(), urgent = S.food.filter(f => f.bites - f.claims > 0 && short.has(f.type));
     if (urgent.length && Math.random() < 0.9) { urgent.sort((p, r) => Math.abs(p.x - a.x) - Math.abs(r.x - a.x)); return forageJob(a, urgent[0]); }
   }
-  if (grown && !stormy() && storeTotal() < STORE_CAP * 2 - 6) {
+  if (grown && !stormy() && storeTotal() < 40) { // stores comfortably full: leave hands free for nursing
     const foragers = S.ants.filter(x => x.carry && x.carry.kind === 'food').length;
     const avail = S.food.filter(f => f.bites - f.claims > 0);
     if (avail.length && foragers < 14 && Math.random() < 0.75) {
@@ -662,18 +859,21 @@ function chomp(x, y) { S.parts.push({ k: 'chomp', x, y, vx: 0, vy: -12, life: 0.
 // ---- Lifecycle -----------------------------------------------------------
 function updateQueen(dt) {
   const q = S.queen;
+  if (q.hunger > 1.6 && !q.claimed && !stocked(q.want)) { const have = FOOD_TYPES.filter(stocked); if (have.length) q.want = pick(have); }
   q.hunger += dt / 28; q.pulse = Math.max(0, q.pulse - dt); q.happy = Math.max(0, q.happy - dt);
   q.layT -= dt;
   if (q.layT <= 0) {
     const used = new Set(S.brood.filter(b => b.where === 'queen').map(b => b.slot));
     let slot = -1; for (let i = 0; i < 5; i++) if (!used.has(i)) { slot = i; break; }
-    const pop = S.ants.length + S.brood.length;
-    if (slot >= 0 && S.brood.length < BROOD_CAP && pop < POP_CAP) {
+    const short = POP_TARGET - projectedPop(); // at the target that's ~13 adults' worth + ~13 brood
+    // like real colonies: lay less when food is short, and never more babies than the workers can look after
+    const fedEnough = storeTotal() >= 6, room = S.brood.length < Math.min(BROOD_CAP, Math.max(6, Math.round(S.ants.length * 0.6)));
+    if (slot >= 0 && room && fedEnough && short > 0 && S.ants.length < POP_HIGH - 2) {
       S.brood.push({ id: uid++, stage: 'egg', where: 'queen', nest: null, slot, t: 0, fed: 0, since: 0, claimed: false, hungry: false, x: 0, y: 0, wig: rand(0, 6), want: pick(FOOD_TYPES), happy: 0, refuse: 0 });
       q.pulse = 0.8; S.stats.eggs++;
       const p = floorPt(CH.Q, qEggU(slot), 4); sparkle(p.x, p.y - 4, 4);
     }
-    q.layT = S.ants.length < 14 ? rand(3, 5) : rand(6, 10);
+    q.layT = short > 0 ? lerp(8, 2, clamp(short / 8, 0, 1)) * rand(0.85, 1.15) : rand(3, 5); // short of ants: lay faster
   }
 }
 function updateBrood(dt) {
@@ -682,11 +882,15 @@ function updateBrood(dt) {
     if (b.where === 'queen') { const p = floorPt(CH.Q, qEggU(b.slot), 3); b.x = p.x; b.y = p.y - (b.slot % 2) * 5 * K; continue; }
     if (b.where !== 'nursery') continue;
     const p = floorPt(CH[b.nest], slotU(b.nest, b.slot), 4); b.x = p.x; b.y = p.y;
-    b.t += dt; b.since += dt; b.happy = Math.max(0, (b.happy || 0) - dt); b.refuse = Math.max(0, (b.refuse || 0) - dt);
+    const pace = broodPace();
+    b.t += dt * pace; b.since += dt * pace; b.happy = Math.max(0, (b.happy || 0) - dt); b.refuse = Math.max(0, (b.refuse || 0) - dt);
     if (b.stage === 'egg' && b.t > 16) { b.stage = 'larva'; b.t = 0; b.since = 4; sparkle(b.x, b.y, 2); }
     else if (b.stage === 'larva') {
-      b.hungry = b.fed < 3 && b.since > 5;
-      if (b.fed >= 3 && b.since > 6 && !b.claimed) { b.stage = 'pupa'; b.t = 0; b.hungry = false; }
+      b.hungry = b.fed < mealsNeeded() && b.since > 5;
+      if (b.hungry && !b.claimed && b.since > 40 && !stocked(b.want)) { // fed up waiting: it fancies something we have
+        const have = FOOD_TYPES.filter(stocked); if (have.length) b.want = pick(have);
+      }
+      if (b.fed >= mealsNeeded() && b.since > 6 && !b.claimed) { b.stage = 'pupa'; b.t = 0; b.hungry = false; }
     } else if (b.stage === 'pupa' && b.t > 18) {
       S.brood.splice(i, 1); S.nest[b.nest][b.slot] = null;
       const a = new Ant({ node: b.nest, u: slotU(b.nest, b.slot) }, 0);
@@ -699,13 +903,13 @@ function updateFood(dt) {
   S.nextFood -= dt;
   const night = nightness(S.day);
   if (S.nextFood <= 0) {
-    S.nextFood = rand(4, 7) * (night > 0.5 ? 2.5 : 1);
-    if ((S.food.length < 6 || (S.food.length < 8 && wantedShort().size)) && !stormy()) {
+    S.nextFood = rand(2.5, 4.5) * (night > 0.5 ? 1.5 : 1) * (storeTotal() > 50 ? 2 : 1);
+    if ((S.food.length < 7 || (S.food.length < 9 && wantedShort().size)) && !stormy()) {
       const lo = Math.max(60, visL + 50), hi = Math.min(1320, visR - 50);
       let x, tries = 0;
       do { x = rand(lo, hi); tries++; } while ((Math.abs(x - 800) < 90 || S.food.some(f => Math.abs(f.x - x) < 60)) && tries < 20);
       const short = [...wantedShort()].filter(t => !S.food.some(f => f.type === t));
-      const type = short.length && Math.random() < 0.7 ? pick(short) : pick(FOOD_TYPES), bites = 2 + Math.floor(Math.random() * 5);
+      const type = short.length && Math.random() < 0.7 ? pick(short) : pick(FOOD_TYPES), bites = 3 + Math.floor(Math.random() * 5);
       S.food.push({ x, type, bites, max: bites, claims: 0, born: S.t, rot: rand(-0.6, 0.6) });
     }
   }
@@ -785,7 +989,7 @@ function updateRaids(dt) {
 // turns straight round to fight.
 const onSurface = a => a.loc.node === 'E' && Math.abs(a.y - (SURF - LIFT)) < 1;
 function canDefend(a) {
-  if (a.mode || a.age <= 20 || a.hp < 70) return false;
+  if (a.mode || a.age <= 20 || a.hp < 70 || a.grey > 0.4) return false; // too young, hurt or too old to fight
   if (a.interruptible) return true;
   return onSurface(a) && (!a.carry || a.carry.kind === 'food');
 }
@@ -814,7 +1018,7 @@ function updateDefender(a, dt) {
   }
   const d = dist(a, r);
   if (!a.fighting && d < 42 * K) { // join the scuffle on whichever side we arrived
-    a.fighting = true; a.loc = r.path.length ? r.path[0].loc : r.loc;
+    a.fighting = true; a.path = []; a.loc = r.path.length ? r.path[0].loc : r.loc;
     const side = Math.sign((a.x - r.x) * r.dir.x + (a.y - r.y) * r.dir.y) || 1;
     a.side = side; a.tier = attackersOf(r).filter(o => o !== a && o.fighting && o.side === side).length;
   }
@@ -843,17 +1047,23 @@ function updateAnts(dt) {
   for (let i = S.ants.length - 1; i >= 0; i--) {
     const a = S.ants[i];
     a.age += dt; a.hop = Math.max(0, a.hop - dt); a.lunge = Math.max(0, a.lunge - dt);
+    a.grey = Math.max(a.grey || 0, clamp((a.age - (a.life - 55)) / 50, 0, 1)); // greying over its last minute
     if (!a.fighting && a.hp < 100) a.hp = Math.min(100, a.hp + dt * (a.mode ? 2 : 6));
     if (a.mode === 'defend') { updateDefender(a, dt); continue; }
+    // an ant just loafing about notices hungry babies and goes to help
+    a.hunger += dt * a.hungerRate;
+    if (a.hunger > 1 && !a.want) a.want = pickSnack(a);
+    if (a.job && a.job.idle && Math.random() < dt * 0.7 && (hungryLarvae().length || a.hunger > 1.2)) { a.abort(); a.idleT = 0; }
     if (a.job) { a.runJob(dt); continue; }
     a.moving = false;
     if (a.age > a.life) { // old age: only when resting, and never if the colony is small
-      if (S.ants.length > 14) {
+      if (S.ants.length > POP_LOW) {
         S.ants.splice(i, 1); S.stats.died++; DBG.event('ant died of old age');
-        S.corpses.push({ id: a.id, x: a.x, y: a.y + 5 * K, f: a.f, loc: a.loc, state: 'lying', claimed: false, decay: 0 });
+        S.corpses.push({ id: a.id, x: a.x, y: a.y + 5 * K, f: a.f, loc: a.loc, state: 'lying', claimed: false, decay: 0, col: antColor(a)[0] });
+        sparkle(a.x, a.y - 6 * K, 3);
         continue;
       }
-      a.life += 60;
+      a.life += 20; // the colony is small: hang on a little longer
     }
     a.idleT = (a.idleT || 0) - dt;
     if (a.idleT <= 0) { a.job = chooseJob(a); a.idleT = 0; }
@@ -939,7 +1149,7 @@ function drawAnt(x, y, o) {
 function drawCarry(c, x, y) {
   if (c.kind === 'food') drawFoodBit(c.type, x + 2, y, 3.4 * Math.sqrt(K));
   else if (c.kind === 'egg') drawEgg(x + 3, y, 1);
-  else if (c.kind === 'corpse') drawAnt(x + 9, y - 3, { f: 1, s: 0.8, col: c.c.red ? '#9a3020' : ANT_BLACK, dead: true, tilt: 0.25 });
+  else if (c.kind === 'corpse') drawAnt(x + 9, y - 3, { f: 1, s: 0.8, col: c.c.red ? '#9a3020' : c.c.col || ANT_BLACK, dead: true, tilt: 0.25 });
 }
 function drawFoodBit(type, x, y, r, rot = 0) {
   g.save(); g.translate(x, y); g.rotate(rot);
@@ -1012,9 +1222,11 @@ function drawHealth(x, y, hp) {
   g.fillStyle = f > 0.6 ? '#5fd35a' : f > 0.3 ? '#ffd23f' : '#ff5a4a';
   if (f > 0) { g.beginPath(); g.roundRect(x - w / 2, y, w * f, h, 2); g.fill(); }
 }
+const ANT_OLD = '#d3d0d6', ANT_OLD_FAR = '#b5b1b9'; // very old ants fade to a pale grey
 function antColor(a) {
   if (a.red) return [ANT_RED, '#8f2a1a'];
-  if (a.age < 60) { const t = a.age / 60; return [mix('#c08a55', ANT_BLACK, t), mix('#d6a473', '#4a4650', t)]; }
+  if (a.age < 30) { const t = a.age / 30; return [mix('#c08a55', ANT_BLACK, t), mix('#d6a473', '#4a4650', t)]; }
+  if (a.grey > 0) return [mix(ANT_BLACK, ANT_OLD, a.grey), mix('#4a4650', ANT_OLD_FAR, a.grey)];
   return [ANT_BLACK, '#4a4650'];
 }
 function antDraw(a) {
@@ -1026,6 +1238,13 @@ function antDraw(a) {
   const hopY = a.hop > 0 ? -Math.abs(Math.sin(a.hop * 15)) * 10 * K : 0;
   drawAnt(a.x + jx, a.y + hopY, { f: a.f, s: AS * (a.red ? 1.08 : 1), tilt: a.tilt, col, farCol: far, ph: a.ph, moving: a.moving, carry: a.carry, anim: a.anim, red: a.red, lunge: a.lunge });
   a.showHp = inFight || a.hp < 99.5;
+  if (!a.red && a.hunger > 1 && a.want && !a.carry && !a.fighting) { // thought bubble: "I fancy a ..."
+    const bx = a.x + a.f * 8 * K, by = a.y - 34 * K + Math.sin(S.t * 3 + a.id) * 1.5;
+    g.fillStyle = 'rgba(255,255,255,0.88)';
+    g.beginPath(); g.arc(a.x + a.f * 3 * K, a.y - 19 * K, 1.8 * K, 0, 7); g.fill();
+    g.beginPath(); g.arc(bx, by, 8.5 * K, 0, 7); g.fill();
+    drawFoodBit(a.want, bx, by, 3.6 * K);
+  }
 }
 
 function render() {
@@ -1101,7 +1320,7 @@ function render() {
   }
   for (const c of S.corpses) { // the dead, and the graveyard
     if (c.state === 'carried') continue;
-    const base = c.red ? '#9a3020' : '#2a2a2e';
+    const base = c.red ? '#9a3020' : c.col ? hexOf(c.col) : '#2a2a2e';
     if (c.state === 'lying') drawAnt(c.x, c.y, { f: c.f, s: AS, col: base, dead: true });
     else {
       const d = c.decay;
@@ -1383,13 +1602,14 @@ function debugState() {
   return {
     simT: Math.round(S.t), day: +S.day.toFixed(3), speed: SPEED,
     weather: { state: Wx.state, left: Math.round(Wx.left), cover: +Wx.cover.toFixed(2), rain: +Wx.rain.toFixed(2), storm: +Wx.storm.toFixed(2) },
-    ants: S.ants.length, outside: count(S.ants, onSurface), defending: count(S.ants, a => a.mode === 'defend'), invaders: S.invaders.length,
+    ants: S.ants.length, projected: projectedPop(), outside: count(S.ants, onSurface), defending: count(S.ants, a => a.mode === 'defend'), invaders: S.invaders.length,
     brood: { eggsQ: count(S.brood, b => b.where === 'queen'), eggs: count(S.brood, b => b.where === 'nursery' && b.stage === 'egg'),
       larvae: count(S.brood, b => b.stage === 'larva'), hungry: count(S.brood, b => b.hungry), pupae: count(S.brood, b => b.stage === 'pupa') },
     stores: { F1: S.stores.F1.length, F2: S.stores.F2.length }, food: S.food.length, queenHunger: +S.queen.hunger.toFixed(2),
     corpses: { lying: count(S.corpses, c => c.state === 'lying'), carried: count(S.corpses, c => c.state === 'carried'), grave: count(S.corpses, c => c.state === 'grave') },
     stats: S.stats, fps: Math.round(MON.frames / Math.max(0.001, el)), slowFrames: MON.slow, worstMs: Math.round(MON.worst),
-    view: { w: cw, h: chh, rot: ROT, phone: PHONE, scale: +scale.toFixed(3) }, hidden: document.hidden, sound: SND.on ? SND.state : 'off',
+    view: { w: cw, h: chh, rot: ROT, phone: PHONE, scale: +scale.toFixed(3) }, hidden: document.hidden, sound: SND.on ? SND.state : 'off', fullscreen: !!document.fullscreenElement, wakeLock: !!wakeLock,
+    peckish: S.ants.filter(a => a.hunger > 1).length,
   };
 }
 function once(key, msg, data) { if (MON.seen.has(key)) return; MON.seen.add(key); DBG.anomaly(msg, data); }
@@ -1424,7 +1644,10 @@ function checkAnomalies() {
   }
   for (const k of MON.corpseSeen.keys()) if (!ids.has(k)) MON.corpseSeen.delete(k);
   for (const b of S.brood) if (b.hungry && b.since > 150) once('hungry' + b.id, 'larva hungry for 150 s', { nest: b.nest, slot: b.slot, fed: b.fed, want: b.want, inStore: stocked(b.want), onGround: S.food.filter(f => f.type === b.want).length, claimed: b.claimed, stores: S.stores.F1.length + S.stores.F2.length });
-  if (S.ants.length < 12) once('poplow' + Math.floor(S.t / 300), 'population low', { ants: S.ants.length, brood: S.brood.length });
+  // population outside its band for over a minute
+  const n = S.ants.length, out = n < POP_LOW ? 'low' : n > POP_HIGH ? 'high' : null;
+  if (out) { MON.popOut = MON.popOut ?? S.t; if (S.t - MON.popOut > 60) once('pop' + out + Math.floor(MON.popOut), 'population ' + out + ' for 60 s', { ants: n, brood: S.brood.length, projected: projectedPop(), band: [POP_LOW, POP_HIGH] }); }
+  else MON.popOut = null;
 }
 function debugTick(rawMs) {
   if (!DBG.on) return;
@@ -1442,6 +1665,19 @@ addEventListener('pointerup', () => {
   document.documentElement.requestFullscreen({ navigationUI: 'hide' })
     .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape')).catch(() => {});
 });
+// Keep the screen (and computer) awake while the game is full screen.
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+      DBG.event('wake lock', { on: true });
+    } else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; DBG.event('wake lock', { on: false }); }
+  } catch (e) { DBG.record('warn', 'wake lock unavailable', { err: e.message }); }
+}
+document.addEventListener('fullscreenchange', () => keepAwake(!!document.fullscreenElement));
+document.addEventListener('visibilitychange', () => { if (!document.hidden && document.fullscreenElement) keepAwake(true); }); // the browser drops it when hidden
 addEventListener('resize', resize);
 DBG.init();
 resize(); init();
